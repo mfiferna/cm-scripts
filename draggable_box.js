@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DraggableBox
 // @namespace    https://example.com
-// @version      1.5
+// @version      1.6
 // @description  Icons that show a lazily-created draggable box on hover, hide on unhover, toggle permanent show/hide on click, properly execute <script> tags, and fix drag offset/text selection issues.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
