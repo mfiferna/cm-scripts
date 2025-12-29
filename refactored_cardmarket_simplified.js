@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      4.3
+// @version      4.4
 // @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
@@ -414,7 +414,27 @@
         });
 
         const chartWrapper = doc.querySelector('#tabContent-info .chart-wrapper');
-        const chartWrapperHTML = chartWrapper ? chartWrapper.outerHTML : '';
+        let chartWrapperHTML = '';
+        
+        if (chartWrapper) {
+            // Generate a unique ID for this chart to avoid duplicate ID issues
+            const uniqueId = 'chart-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+            chartWrapperHTML = chartWrapper.outerHTML;
+            
+            // Replace the canvas ID with our unique ID
+            // Match patterns like id="priceGuide-123" or id='priceGuide-123'
+            chartWrapperHTML = chartWrapperHTML.replace(
+                /(<canvas[^>]+id=["'])([^"']+)(["'][^>]*>)/,
+                `$1${uniqueId}$3`
+            );
+            
+            // Replace references to the old ID in the script tag with the new unique ID
+            // This handles Chart initialization like: document.getElementById('priceGuide-123')
+            chartWrapperHTML = chartWrapperHTML.replace(
+                /getElementById\(['"]([^'"]+)['"]\)/g,
+                `getElementById('${uniqueId}')`
+            );
+        }
 
         return { averagePriceText, trendPriceText, chartWrapperHTML };
     }
