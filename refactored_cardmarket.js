@@ -1,8 +1,13 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      4.1
+// @version      4.2
 // @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
+// @author       mfiferna
+// @homepage     https://github.com/mfiferna/cm-scripts
+// @supportURL   https://github.com/mfiferna/cm-scripts/issues
+// @downloadURL  https://github.com/mfiferna/cm-scripts/raw/main/refactored_cardmarket.js
+// @updateURL    https://github.com/mfiferna/cm-scripts/raw/main/refactored_cardmarket.js
 // @match        https://www.cardmarket.com/en/Magic/Users/*/Offers/*
 // @match        https://www.cardmarket.com/en/Magic/ShoppingCart
 // @grant        GM_xmlhttpRequest
@@ -25,7 +30,8 @@
     let mainButton;
     const cacheDataVersion = 2;
     const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000;
-
+    // Clean up expired cache entries on script initialization
+    cleanupExpiredCache();
     // Instead of always calling initializeScript, decide which page we’re on:
     document.addEventListener('DOMContentLoaded', () => {
         if (isOffersPage()) {
@@ -991,6 +997,57 @@
 
         // Expired or invalid
         return null;
+    }
+
+    /**
+     * Removes expired entries from localStorage to prevent storage bloat.
+     * This runs automatically on script initialization.
+     */
+    function cleanupExpiredCache() {
+        const now = Date.now();
+        let removedCount = 0;
+        let checkedCount = 0;
+        const keysToRemove = [];
+
+        // Iterate through localStorage keys
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            
+            // Only check keys that appear to be our cache entries
+            // (they contain URLs and version markers with pipe separator)
+            if (key && key.includes('cardmarket.com') && key.includes('|')) {
+                checkedCount++;
+                const cachedString = localStorage.getItem(key);
+                
+                if (cachedString) {
+                    try {
+                        const cachedObj = JSON.parse(cachedString);
+                        const { timestamp } = cachedObj;
+                        
+                        // Check if expired
+                        if (timestamp && (now - timestamp >= CACHE_EXPIRATION_MS)) {
+                            keysToRemove.push(key);
+                        }
+                    } catch (err) {
+                        // If we can't parse it, it's corrupted - remove it
+                        console.warn(`[cache-cleanup] Removing corrupted cache entry: ${key}`);
+                        keysToRemove.push(key);
+                    }
+                }
+            }
+        }
+
+        // Remove expired entries
+        keysToRemove.forEach(key => {
+            localStorage.removeItem(key);
+            removedCount++;
+        });
+
+        if (removedCount > 0) {
+            console.log(`[cache-cleanup] Removed ${removedCount} expired entries out of ${checkedCount} checked.`);
+        } else {
+            console.log(`[cache-cleanup] No expired entries found (checked ${checkedCount} entries).`);
+        }
     }
 
 })();

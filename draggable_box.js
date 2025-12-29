@@ -1,8 +1,13 @@
 // ==UserScript==
 // @name         DraggableBox
 // @namespace    https://example.com
-// @version      1.4
+// @version      1.5
 // @description  Icons that show a lazily-created draggable box on hover, hide on unhover, toggle permanent show/hide on click, properly execute <script> tags, and fix drag offset/text selection issues.
+// @author       mfiferna
+// @homepage     https://github.com/mfiferna/cm-scripts
+// @supportURL   https://github.com/mfiferna/cm-scripts/issues
+// @downloadURL  https://github.com/mfiferna/cm-scripts/raw/main/draggable_box.js
+// @updateURL    https://github.com/mfiferna/cm-scripts/raw/main/draggable_box.js
 // @match        *://*.cardmarket.com/*
 // @grant        unsafeWindow
 // @run-at       document-end
