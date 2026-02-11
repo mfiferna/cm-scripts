@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      4.6
+// @version      4.8
 // @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
@@ -10,10 +10,9 @@
 // @updateURL    https://github.com/mfiferna/cm-scripts/raw/main/refactored_cardmarket.js
 // @match        https://www.cardmarket.com/en/Magic/Users/*/Offers/*
 // @match        https://www.cardmarket.com/en/Magic/ShoppingCart
-// @grant        GM_xmlhttpRequest
+// @match        https://www.cardmarket.com/en/Magic/Products/Singles/*/*
 // @grant        GM_log
 // @grant        unsafeWindow
-// @connect      www.cardmarket.com
 // @run-at       document-start
 // ==/UserScript==
 
@@ -25,6 +24,9 @@
     const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 hours
     const REQUEST_DELAY = 1000;
     const DELAY_INCREMENT_ON_429 = 1000;
+    const IFRAME_LOAD_TIMEOUT_MS = 15000;
+    const IFRAME_READY_TIMEOUT_MS = 5000;
+    const IFRAME_READY_INTERVAL_MS = 250;
 
     // State
     let requestDelay = REQUEST_DELAY;
@@ -39,11 +41,14 @@
     // ===== INITIALIZATION =====
 
     function init() {
-        loadChartLibrary();
         if (isOffersPage()) {
+            loadChartLibrary();
             initializeOffersPage();
         } else if (isCartPage()) {
+            loadChartLibrary();
             initializeCartPage();
+        } else if (isProductPage()) {
+            initializeProductPageCache();
         }
     }
 
@@ -53,6 +58,40 @@
 
     function isCartPage() {
         return location.pathname.includes('/en/Magic/ShoppingCart');
+    }
+
+    function isProductPage() {
+        return /^\/en\/Magic\/Products\/Singles\/[^/]+\/[^/]+\/?$/.test(location.pathname);
+    }
+
+    function initializeProductPageCache(attempt = 0) {
+        const pageData = extractPageData(document);
+        if (!hasCacheableProductData(pageData)) {
+            if (attempt < 5) {
+                setTimeout(() => initializeProductPageCache(attempt + 1), 500);
+            } else {
+                GM_log(`[cache] Skipped product-page cache for ${location.href} (missing price data).`);
+            }
+            return;
+        }
+
+        const productUrl = getCurrentProductCacheUrl();
+        setLocalCache([productUrl, CACHE_VERSION], pageData);
+        GM_log(`[cache] Stored opened product page: ${productUrl}`);
+    }
+
+    function hasCacheableProductData(pageData) {
+        return (
+            pageData.averagePriceText !== 'N/A' ||
+            pageData.trendPriceText !== 'N/A' ||
+            Boolean(pageData.chartWrapperHTML)
+        );
+    }
+
+    function getCurrentProductCacheUrl() {
+        const url = new URL(location.href);
+        const foilState = url.searchParams.get('isFoil') === 'Y' ? 'isFoil=Y' : 'isFoil=N';
+        return buildProductUrl(url.toString(), [foilState]);
     }
 
     function loadChartLibrary() {
@@ -381,22 +420,69 @@
     // ===== FETCHING & CACHING =====
 
     function fetchProductData(productUrl) {
-        return getCachedData([productUrl, CACHE_VERSION], CACHE_EXPIRATION_MS, async () => {
-            const doc = await new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: "GET",
-                    url: productUrl,
-                    onload: response => {
-                        if (response.status === 200) {
-                            resolve(new DOMParser().parseFromString(response.responseText, 'text/html'));
-                        } else {
-                            reject(new Error(`Non-200 response: ${response.status}`));
-                        }
-                    },
-                    onerror: reject
-                });
-            });
-            return extractPageData(doc);
+        return getCachedData([productUrl, CACHE_VERSION], CACHE_EXPIRATION_MS, () => fetchProductDataViaIframe(productUrl));
+    }
+
+    function fetchProductDataViaIframe(productUrl) {
+        return new Promise((resolve, reject) => {
+            const iframe = document.createElement('iframe');
+            iframe.style.cssText = 'position:absolute;width:0;height:0;border:0;visibility:hidden;pointer-events:none;left:-9999px;top:-9999px';
+
+            let settled = false;
+            let loadTimeout;
+            let pollInterval;
+
+            const cleanup = () => {
+                clearTimeout(loadTimeout);
+                clearInterval(pollInterval);
+                iframe.removeEventListener('load', onLoad);
+                iframe.removeEventListener('error', onError);
+                if (iframe.parentNode) iframe.remove();
+            };
+
+            const finalize = (callback, payload) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                callback(payload);
+            };
+
+            const extractFromFrame = () => {
+                const frameDoc = iframe.contentDocument;
+                return frameDoc ? extractPageData(frameDoc) : null;
+            };
+
+            const onLoad = () => {
+                const startedAt = Date.now();
+                let lastData = extractFromFrame() || { averagePriceText: 'N/A', trendPriceText: 'N/A', chartWrapperHTML: '' };
+
+                if (hasCacheableProductData(lastData)) {
+                    return finalize(resolve, lastData);
+                }
+
+                pollInterval = setInterval(() => {
+                    lastData = extractFromFrame() || lastData;
+                    if (hasCacheableProductData(lastData)) {
+                        return finalize(resolve, lastData);
+                    }
+
+                    if (Date.now() - startedAt >= IFRAME_READY_TIMEOUT_MS) {
+                        GM_log(`[cache] Iframe data timeout for ${productUrl}, using best available data.`);
+                        return finalize(resolve, lastData);
+                    }
+                }, IFRAME_READY_INTERVAL_MS);
+            };
+
+            const onError = () => finalize(reject, new Error(`Iframe navigation failed for "${productUrl}"`));
+
+            loadTimeout = setTimeout(() => {
+                finalize(reject, new Error(`Iframe load timeout for "${productUrl}"`));
+            }, IFRAME_LOAD_TIMEOUT_MS);
+
+            iframe.addEventListener('load', onLoad);
+            iframe.addEventListener('error', onError);
+            iframe.src = productUrl;
+            (document.body || document.documentElement).appendChild(iframe);
         });
     }
 
@@ -442,6 +528,11 @@
         const freshData = await fetchCallback();
         localStorage.setItem(storageKey, JSON.stringify({ timestamp: Date.now(), data: freshData }));
         return freshData;
+    }
+
+    function setLocalCache(keyParts, data) {
+        const storageKey = keyParts.join('|');
+        localStorage.setItem(storageKey, JSON.stringify({ timestamp: Date.now(), data }));
     }
 
     function checkLocalCache(keyParts) {
