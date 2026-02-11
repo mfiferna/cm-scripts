@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      4.8
+// @version      4.9
 // @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
@@ -27,6 +27,8 @@
     const IFRAME_LOAD_TIMEOUT_MS = 15000;
     const IFRAME_READY_TIMEOUT_MS = 5000;
     const IFRAME_READY_INTERVAL_MS = 250;
+    const IFRAME_MANUAL_TIMEOUT_MS = 5 * 60 * 1000;
+    const IFRAME_MANUAL_POLL_INTERVAL_MS = 500;
 
     // State
     let requestDelay = REQUEST_DELAY;
@@ -431,12 +433,15 @@
             let settled = false;
             let loadTimeout;
             let pollInterval;
+            let unblockOverlay;
+            let manualUnblockStarted = false;
 
             const cleanup = () => {
                 clearTimeout(loadTimeout);
                 clearInterval(pollInterval);
                 iframe.removeEventListener('load', onLoad);
                 iframe.removeEventListener('error', onError);
+                if (unblockOverlay?.parentNode) unblockOverlay.remove();
                 if (iframe.parentNode) iframe.remove();
             };
 
@@ -447,23 +452,66 @@
                 callback(payload);
             };
 
-            const extractFromFrame = () => {
-                const frameDoc = iframe.contentDocument;
-                return frameDoc ? extractPageData(frameDoc) : null;
+            const readFrameState = () => {
+                try {
+                    const frameDoc = iframe.contentDocument;
+                    if (!frameDoc) {
+                        return { data: null, blocked: false };
+                    }
+                    return {
+                        data: extractPageData(frameDoc),
+                        blocked: isLikelyBlockedDocument(frameDoc)
+                    };
+                } catch (err) {
+                    // Security challenge pages may temporarily be cross-origin.
+                    return { data: null, blocked: true };
+                }
+            };
+
+            const startManualUnblockMode = () => {
+                if (manualUnblockStarted) return;
+                manualUnblockStarted = true;
+                GM_log(`[cache] Request appears blocked for ${productUrl}. Showing interactive iframe.`);
+
+                unblockOverlay = showUnblockOverlay(iframe, productUrl, () => {
+                    finalize(reject, new Error(`Manual unblock canceled for "${productUrl}"`));
+                });
+
+                const startedAt = Date.now();
+                pollInterval = setInterval(() => {
+                    const state = readFrameState();
+                    if (state.data && hasCacheableProductData(state.data)) {
+                        return finalize(resolve, state.data);
+                    }
+
+                    if (Date.now() - startedAt >= IFRAME_MANUAL_TIMEOUT_MS) {
+                        return finalize(reject, new Error(`Manual unblock timeout for "${productUrl}"`));
+                    }
+                }, IFRAME_MANUAL_POLL_INTERVAL_MS);
             };
 
             const onLoad = () => {
+                clearTimeout(loadTimeout);
                 const startedAt = Date.now();
-                let lastData = extractFromFrame() || { averagePriceText: 'N/A', trendPriceText: 'N/A', chartWrapperHTML: '' };
+                let lastData = { averagePriceText: 'N/A', trendPriceText: 'N/A', chartWrapperHTML: '' };
 
-                if (hasCacheableProductData(lastData)) {
-                    return finalize(resolve, lastData);
-                }
+                const initialState = readFrameState();
+                if (initialState.data) lastData = initialState.data;
+
+                if (hasCacheableProductData(lastData)) return finalize(resolve, lastData);
+                if (initialState.blocked) return startManualUnblockMode();
 
                 pollInterval = setInterval(() => {
-                    lastData = extractFromFrame() || lastData;
+                    const state = readFrameState();
+                    if (state.data) lastData = state.data;
+
                     if (hasCacheableProductData(lastData)) {
                         return finalize(resolve, lastData);
+                    }
+
+                    if (state.blocked) {
+                        clearInterval(pollInterval);
+                        return startManualUnblockMode();
                     }
 
                     if (Date.now() - startedAt >= IFRAME_READY_TIMEOUT_MS) {
@@ -484,6 +532,85 @@
             iframe.src = productUrl;
             (document.body || document.documentElement).appendChild(iframe);
         });
+    }
+
+    function showUnblockOverlay(iframe, productUrl, onCancel) {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = [
+            'position:fixed',
+            'z-index:2147483647',
+            'inset:0',
+            'background:rgba(0,0,0,0.55)',
+            'display:flex',
+            'flex-direction:column',
+            'gap:8px',
+            'padding:12px'
+        ].join(';');
+
+        const panel = document.createElement('div');
+        panel.style.cssText = [
+            'display:flex',
+            'align-items:center',
+            'justify-content:space-between',
+            'gap:8px',
+            'padding:8px 10px',
+            'background:#fff',
+            'border:1px solid #ccc',
+            'font:13px/1.4 sans-serif'
+        ].join(';');
+
+        const message = document.createElement('div');
+        message.textContent = `Cardmarket blocked background loading for ${productUrl}. Complete the verification below to continue.`;
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.className = 'btn btn-sm btn-secondary';
+        cancelBtn.style.cssText = 'margin-left:auto;white-space:nowrap';
+        cancelBtn.addEventListener('click', onCancel);
+
+        panel.append(message, cancelBtn);
+
+        iframe.style.cssText = [
+            'position:relative',
+            'display:block',
+            'width:100%',
+            'height:100%',
+            'min-height:320px',
+            'border:1px solid #bbb',
+            'background:#fff',
+            'visibility:visible',
+            'pointer-events:auto'
+        ].join(';');
+
+        overlay.append(panel, iframe);
+        (document.body || document.documentElement).appendChild(overlay);
+        return overlay;
+    }
+
+    function isLikelyBlockedDocument(doc) {
+        const title = (doc.title || '').toLowerCase();
+        const bodyText = (doc.body?.innerText || '').toLowerCase();
+        const markers = [
+            'just a moment',
+            'verify you are human',
+            'checking your browser',
+            'captcha',
+            'security check',
+            'access denied',
+            'attention required'
+        ];
+
+        if (markers.some(marker => title.includes(marker) || bodyText.includes(marker))) {
+            return true;
+        }
+
+        return Boolean(
+            doc.querySelector('#challenge-form') ||
+            doc.querySelector('#challenge-running') ||
+            doc.querySelector('[name="cf_captcha_kind"]') ||
+            doc.querySelector('iframe[src*="challenge"]')
+        );
     }
 
     function extractPageData(doc) {
