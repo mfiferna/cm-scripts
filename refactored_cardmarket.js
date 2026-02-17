@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      4.9
+// @version      5.0
 // @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
