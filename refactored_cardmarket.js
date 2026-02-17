@@ -783,7 +783,37 @@
 
     function parsePrice(priceText) {
         if (!priceText || priceText === 'N/A') return NaN;
-        return parseFloat(priceText.replace(' €', '').replace(',', '.').trim());
+        const normalizedText = String(priceText)
+            .replace(/\s/g, '')
+            .replace(/[^\d.,-]/g, '');
+
+        if (!normalizedText || normalizedText === '-') return NaN;
+
+        const lastDot = normalizedText.lastIndexOf('.');
+        const lastComma = normalizedText.lastIndexOf(',');
+
+        if (lastDot === -1 && lastComma === -1) return parseFloat(normalizedText);
+
+        const decimalSeparator = lastDot > lastComma ? '.' : ',';
+        const thousandSeparator = decimalSeparator === '.' ? ',' : '.';
+
+        const decimalCount = normalizedText.split(decimalSeparator).length - 1;
+        const lastDecimalIndex = normalizedText.lastIndexOf(decimalSeparator);
+        const decimalDigits = normalizedText.length - lastDecimalIndex - 1;
+
+        const hasThousandsOnly =
+            decimalCount > 1 ||
+            (decimalCount === 1 && decimalDigits === 3);
+
+        if (hasThousandsOnly) {
+            return parseFloat(normalizedText.replace(/[.,]/g, ''));
+        }
+
+        return parseFloat(
+            normalizedText
+                .replace(new RegExp(`\\${thousandSeparator}`, 'g'), '')
+                .replace(decimalSeparator, '.')
+        );
     }
 
     function getFoilState(row) {
