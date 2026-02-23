@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      5.5
+// @version      5.7
 // @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
@@ -28,6 +28,7 @@
     const DEFAULT_SETTINGS = {
         cacheExpirationHours: 24,
         requestDelayMs: 1000,
+        maxInFlightRequests: 0,
         delayRandomizationPercent: 15,
         queueMode: 'wait_for_load',
         delayIncrementOn429Ms: 1000,
@@ -38,6 +39,7 @@
     const SETTINGS_FIELDS = [
         { key: 'cacheExpirationHours', label: 'Cache Expiration (hours)', min: 1, max: 720, step: 1 },
         { key: 'requestDelayMs', label: 'Request Delay (ms)', min: 100, max: 10000, step: 50 },
+        { key: 'maxInFlightRequests', label: 'Max In-Flight Requests (0 = unlimited)', min: 0, max: 100, step: 1 },
         { key: 'delayRandomizationPercent', label: 'Delay Randomization (+/- %)', min: 0, max: 100, step: 1 },
         {
             key: 'queueMode',
@@ -62,6 +64,9 @@
     let mainButton;
     let settingsModal = null;
     let settingsModalClose = null;
+    let activeIframeRequests = new Set();
+    let nextIframeRequestId = 1;
+    let cloudflareGate = null;
 
     // Initialize
     cleanupExpiredCache();
@@ -341,6 +346,35 @@
         }
     }
 
+    function createRetryableError(message, code) {
+        const error = new Error(message);
+        error.code = code;
+        error.retryable = true;
+        return error;
+    }
+
+    function isRetryableFetchError(error) {
+        if (!error) return false;
+        if (error.retryable) return true;
+        return ['CLOUDFLARE_ABORTED', 'CLOUDFLARE_ACTIVE', 'IFRAME_DATA_UNAVAILABLE'].includes(error.code);
+    }
+
+    function handleQueueFetchError(err, row, queue, productName) {
+        if (/Non-200 response: 429/.test(err.message)) {
+            requestDelay += settings.delayIncrementOn429Ms;
+            queue.push(row); // Retry later
+            return;
+        }
+
+        if (isRetryableFetchError(err)) {
+            queue.push(row);
+            GM_log(`[queue] Retrying "${productName}" after ${err.code || err.message}`);
+            return;
+        }
+
+        logError(`Error fetching "${productName}":`, err);
+    }
+
     function processQueue(queue, finishCallback, progressData = {}) {
         if (settings.queueMode === 'fixed_delay') {
             return processQueueWithFixedDelay(queue, finishCallback, progressData);
@@ -350,6 +384,19 @@
     }
 
     function processQueueWaitForLoad(queue, finishCallback, progressData = {}) {
+        if (cloudflareGate) {
+            return cloudflareGate.promise.finally(() => {
+                if (!cancelRequested) {
+                    setTimeout(
+                        () => processQueueWaitForLoad(queue, finishCallback, progressData),
+                        getRandomizedDelayMs(requestDelay)
+                    );
+                } else {
+                    finishProcessing();
+                }
+            });
+        }
+
         if (queue.length === 0 || cancelRequested) {
             if (queue.length === 0 && finishCallback) finishCallback(progressData);
             return finishProcessing();
@@ -374,12 +421,7 @@
             })
             .catch(err => {
                 if (!cancelRequested) {
-                    if (/Non-200 response: 429/.test(err.message)) {
-                        requestDelay += settings.delayIncrementOn429Ms;
-                        queue.push(row); // Retry later
-                    } else {
-                        logError(`Error fetching "${productName}":`, err);
-                    }
+                    handleQueueFetchError(err, row, queue, productName);
                 }
             })
             .finally(() => {
@@ -398,6 +440,7 @@
         let inFlight = 0;
         let dispatchTimer = null;
         let finished = false;
+        let waitingForCloudflare = false;
 
         const maybeFinish = () => {
             if (finished) return;
@@ -428,8 +471,25 @@
                 return;
             }
 
+            if (cloudflareGate) {
+                if (!waitingForCloudflare) {
+                    waitingForCloudflare = true;
+                    cloudflareGate.promise.finally(() => {
+                        waitingForCloudflare = false;
+                        if (!finished && !cancelRequested) scheduleNext(requestDelay);
+                    });
+                }
+                return;
+            }
+
             if (queue.length === 0) {
                 maybeFinish();
+                return;
+            }
+
+            const maxInFlightRequests = settings.maxInFlightRequests;
+            if (maxInFlightRequests > 0 && inFlight >= maxInFlightRequests) {
+                scheduleNext(requestDelay);
                 return;
             }
 
@@ -457,12 +517,7 @@
                 })
                 .catch(err => {
                     if (!cancelRequested) {
-                        if (/Non-200 response: 429/.test(err.message)) {
-                            requestDelay += settings.delayIncrementOn429Ms;
-                            queue.push(row); // Retry later
-                        } else {
-                            logError(`Error fetching "${productName}":`, err);
-                        }
+                        handleQueueFetchError(err, row, queue, productName);
                     }
                 })
                 .finally(() => {
@@ -561,12 +616,81 @@
 
     // ===== FETCHING & CACHING =====
 
+    function waitForCloudflareGate() {
+        return cloudflareGate ? cloudflareGate.promise : Promise.resolve();
+    }
+
+    function registerActiveIframeRequest(productUrl) {
+        const request = {
+            id: nextIframeRequestId++,
+            productUrl,
+            cancel: null,
+            isCloudflareOwner: false
+        };
+        activeIframeRequests.add(request);
+        return request;
+    }
+
+    function unregisterActiveIframeRequest(request) {
+        activeIframeRequests.delete(request);
+    }
+
+    function cancelOtherActiveIframeRequests(ownerRequestId, triggeringUrl) {
+        const snapshot = Array.from(activeIframeRequests);
+        snapshot.forEach(request => {
+            if (request.id === ownerRequestId) return;
+            if (typeof request.cancel !== 'function') return;
+            request.cancel(
+                createRetryableError(
+                    `Canceled due to Cloudflare challenge while loading "${triggeringUrl}"`,
+                    'CLOUDFLARE_ABORTED'
+                )
+            );
+        });
+    }
+
+    function openCloudflareGate(ownerRequest, productUrl) {
+        if (!cloudflareGate) {
+            let resolveGate;
+            const gatePromise = new Promise(resolve => {
+                resolveGate = resolve;
+            });
+
+            cloudflareGate = {
+                ownerRequestId: ownerRequest.id,
+                productUrl,
+                promise: gatePromise,
+                resolve: resolveGate
+            };
+
+            ownerRequest.isCloudflareOwner = true;
+            GM_log(`[cache] Cloudflare challenge detected for ${productUrl}. Pausing other iframe loads.`);
+            cancelOtherActiveIframeRequests(ownerRequest.id, productUrl);
+            return true;
+        }
+
+        return cloudflareGate.ownerRequestId === ownerRequest.id;
+    }
+
+    function closeCloudflareGateIfOwner(request) {
+        if (!request?.isCloudflareOwner) return;
+        request.isCloudflareOwner = false;
+
+        if (!cloudflareGate || cloudflareGate.ownerRequestId !== request.id) return;
+
+        const resolveGate = cloudflareGate.resolve;
+        cloudflareGate = null;
+        resolveGate();
+        GM_log('[cache] Cloudflare gate closed. Resuming queued loads.');
+    }
+
     function fetchProductData(productUrl) {
         return getCachedData([productUrl, CACHE_VERSION], getCacheExpirationMs(), () => fetchProductDataViaIframe(productUrl));
     }
 
     function fetchProductDataViaIframe(productUrl) {
-        return new Promise((resolve, reject) => {
+        return waitForCloudflareGate().then(() => new Promise((resolve, reject) => {
+            const request = registerActiveIframeRequest(productUrl);
             const iframe = document.createElement('iframe');
             iframe.style.cssText = 'position:absolute;width:0;height:0;border:0;visibility:hidden;pointer-events:none;left:-9999px;top:-9999px';
 
@@ -583,14 +707,21 @@
                 iframe.removeEventListener('error', onError);
                 if (unblockOverlay?.parentNode) unblockOverlay.remove();
                 if (iframe.parentNode) iframe.remove();
+                unregisterActiveIframeRequest(request);
             };
 
             const finalize = (callback, payload) => {
                 if (settled) return;
                 settled = true;
                 cleanup();
+                closeCloudflareGateIfOwner(request);
                 callback(payload);
             };
+
+            request.cancel = (error = createRetryableError(
+                `Iframe request canceled for "${productUrl}"`,
+                'IFRAME_CANCELED'
+            )) => finalize(reject, error);
 
             const readFrameState = () => {
                 try {
@@ -610,6 +741,14 @@
 
             const startManualUnblockMode = () => {
                 if (manualUnblockStarted) return;
+                const ownsCloudflareGate = openCloudflareGate(request, productUrl);
+                if (!ownsCloudflareGate) {
+                    return finalize(
+                        reject,
+                        createRetryableError(`Cloudflare challenge already active for "${productUrl}"`, 'CLOUDFLARE_ACTIVE')
+                    );
+                }
+
                 manualUnblockStarted = true;
                 GM_log(`[cache] Request appears blocked for ${productUrl}. Showing interactive iframe.`);
 
@@ -667,7 +806,10 @@
                             return finalize(resolve, lastData);
                         }
 
-                        return finalize(reject, new Error(`Iframe data unavailable for "${productUrl}"`));
+                        return finalize(
+                            reject,
+                            createRetryableError(`Iframe data unavailable for "${productUrl}"`, 'IFRAME_DATA_UNAVAILABLE')
+                        );
                     }
                 }, IFRAME_READY_INTERVAL_MS);
             };
@@ -682,7 +824,7 @@
             iframe.addEventListener('error', onError);
             iframe.src = productUrl;
             (document.body || document.documentElement).appendChild(iframe);
-        });
+        }));
     }
 
     function showUnblockOverlay(iframe, productUrl, onCancel) {
@@ -812,7 +954,7 @@
 
         const freshData = await fetchCallback();
         if (!hasCacheableProductData(freshData)) {
-            throw new Error(`Non-cacheable product data for "${storageKey}"`);
+            throw createRetryableError(`Non-cacheable product data for "${storageKey}"`, 'NON_CACHEABLE_PRODUCT_DATA');
         }
 
         localStorage.setItem(storageKey, JSON.stringify({ timestamp: Date.now(), data: freshData }));
@@ -902,6 +1044,7 @@
         return {
             cacheExpirationHours: sanitizeInteger(source.cacheExpirationHours, DEFAULT_SETTINGS.cacheExpirationHours, 1, 720),
             requestDelayMs: sanitizeInteger(source.requestDelayMs, DEFAULT_SETTINGS.requestDelayMs, 100, 10000),
+            maxInFlightRequests: sanitizeInteger(source.maxInFlightRequests, DEFAULT_SETTINGS.maxInFlightRequests, 0, 100),
             delayRandomizationPercent: sanitizeInteger(source.delayRandomizationPercent, DEFAULT_SETTINGS.delayRandomizationPercent, 0, 100),
             queueMode: sanitizeQueueMode(source.queueMode),
             delayIncrementOn429Ms: sanitizeInteger(source.delayIncrementOn429Ms, DEFAULT_SETTINGS.delayIncrementOn429Ms, 0, 10000),
