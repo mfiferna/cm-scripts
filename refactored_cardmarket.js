@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      5.9
+// @version      6.4
 // @description  Preloads daily price-guide data, renders ratios immediately, and loads graphs on demand.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
@@ -22,15 +22,15 @@
     'use strict';
 
     // Constants
-    const CACHE_VERSION = 3;
     const PRICE_GUIDE_CACHE_VERSION = 1;
     const SETTINGS_VERSION = 2;
     const SETTINGS_STORAGE_KEY = 'cm-refactored-settings';
     const PRICE_GUIDE_URL = 'https://downloads.s3.cardmarket.com/productCatalog/priceGuide/price_guide_1.json';
-    const PRICE_GUIDE_CACHE_KEY = `cm-price-guide-cache|${PRICE_GUIDE_CACHE_VERSION}`;
     const CACHE_DB_NAME = 'cm-refactored-cache-db';
-    const CACHE_DB_VERSION = 1;
-    const CACHE_DB_STORE = 'entries';
+    const CACHE_DB_VERSION = 2;
+    const PRODUCT_CACHE_STORE = 'products';
+    const META_CACHE_STORE = 'meta';
+    const PRICE_GUIDE_META_KEY = 'price-guide-meta';
     const IFRAME_READY_INTERVAL_MS = 250;
     const IFRAME_MANUAL_POLL_INTERVAL_MS = 500;
     const DEFAULT_SETTINGS = {
@@ -82,6 +82,14 @@
     let priceGuideWarmupPromise = null;
     let cacheDbPromise = null;
     const priceGuideStatusBadges = new Set();
+    const rowChartHtmlMap = new WeakMap(); // row element → chartWrapperHTML string
+    const scriptStartMs = Date.now();
+    const PERF_DIAGNOSTICS_ENABLED = true;
+
+    function logPerf(message) {
+        if (!PERF_DIAGNOSTICS_ENABLED) return;
+        GM_log(`[perf] ${message}`);
+    }
 
     // Initialize
     void cleanupExpiredCache();
@@ -90,6 +98,9 @@
     // ===== INITIALIZATION =====
 
     function init() {
+        const elapsedSinceStart = Date.now() - scriptStartMs;
+        logPerf(`init start after ${elapsedSinceStart}ms; path=${location.pathname}`);
+
         if (isOffersPage()) {
             loadChartLibrary();
             initializeOffersPage();
@@ -125,7 +136,10 @@
         }
 
         const productUrl = getCurrentProductCacheUrl();
-        setLocalCache([productUrl, CACHE_VERSION], pageData);
+        setLocalCache(productUrl, pageData, {
+            idProduct: extractProductIdFromDocument(document, productUrl),
+            isFoil: getCurrentFoilStateFromUrl(productUrl) === 'Y'
+        });
         GM_log(`[cache] Stored opened product page: ${productUrl}`);
     }
 
@@ -143,6 +157,33 @@
         return buildProductUrl(url.toString(), [foilState]);
     }
 
+    function getCurrentFoilStateFromUrl(urlString) {
+        try {
+            return new URL(urlString).searchParams.get('isFoil') === 'Y' ? 'Y' : 'N';
+        } catch (error) {
+            return /(?:[?&])isFoil=Y(?:[&#]|$)/i.test(urlString) ? 'Y' : 'N';
+        }
+    }
+
+    function extractProductIdFromDocument(doc, productUrl = '') {
+        const candidates = [
+            doc?.querySelector('input[name="idProduct"]')?.value,
+            doc?.querySelector('input[name="productId"]')?.value,
+            doc?.querySelector('[data-id-product]')?.getAttribute('data-id-product'),
+            doc?.querySelector('[data-product-id]')?.getAttribute('data-product-id')
+        ];
+
+        const hrefMatch = /(?:[?&])idProduct=(\d+)/i.exec(productUrl)?.[1]
+            || /(?:[?&])productId=(\d+)/i.exec(productUrl)?.[1];
+        candidates.push(hrefMatch);
+
+        for (const value of candidates) {
+            const parsed = parsePositiveInteger(value);
+            if (parsed) return parsed;
+        }
+        return null;
+    }
+
     function loadChartLibrary() {
         if (typeof Chart === 'undefined') {
             const script = document.createElement('script');
@@ -156,14 +197,14 @@
         ensureSettingsModal();
         insertMainButton('.row.g-0.flex-nowrap.align-items-center.pagination.d-none.d-md-flex.mb-2');
         addPerLineFetchButtons('.article-row', '.col-sellerProductInfo');
-        void warmupPriceGuideData();
+        runInitialHydration(() => getOfferRows(), null, { label: 'offers' });
     }
 
     function initializeCartPage() {
         ensureSettingsModal();
         insertCartMainButton();
         addCartPerLineFetchButtons();
-        void warmupPriceGuideData();
+        runInitialHydration(() => getCartRows(), displayCartTotals, { label: 'cart' });
     }
 
     // ===== BUTTON CREATION =====
@@ -177,7 +218,7 @@
 
         const controls = document.createElement('div');
         controls.style.cssText = 'display:flex;align-items:center;justify-content:flex-end;gap:8px;float:right';
-        const allGraphsButton = createMainBatchButton('💲 All Graphs', 'btn btn-primary btn-sm', 'graphs-all', () =>
+        const allGraphsButton = createMainBatchButton('💲 All', 'btn btn-primary btn-sm', 'graphs-all', () =>
             onMainGraphButtonClick(getOfferRows(), null, allGraphsButton)
         );
         const thresholdButton = createMainBatchButton(
@@ -195,8 +236,8 @@
         if (!cardBody) return;
 
         const controls = document.createElement('div');
-        controls.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:8px';
-        const allGraphsButton = createMainBatchButton('💲 All Graphs', 'btn btn-primary btn-sm', 'graphs-all', () =>
+        controls.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px';
+        const allGraphsButton = createMainBatchButton('💲 All', 'btn btn-primary btn-sm', 'graphs-all', () =>
             onMainGraphButtonClick(getCartRows(), null, allGraphsButton)
         );
         const thresholdButton = createMainBatchButton(
@@ -213,6 +254,7 @@
         const button = createButton(text, className);
         button.dataset.role = role;
         button.dataset.idleText = text;
+        button.style.whiteSpace = 'nowrap';
         button.addEventListener('click', onClick);
         mainButtons.push(button);
         return button;
@@ -223,22 +265,23 @@
         badge.style.cssText = [
             'display:inline-flex',
             'align-items:center',
-            'height:31px',
-            'padding:0 8px',
-            'border-radius:4px',
-            'font-size:12px',
+            'padding:0.25rem 0.5rem',
+            'border-radius:0.2rem',
+            'font-size:0.765625rem',
+            'line-height:1.5',
             'border:1px solid #bbb',
             'background:#f7f7f7',
             'color:#555',
             'white-space:nowrap'
         ].join(';');
-        badge.textContent = 'Price guide: idle';
+        badge.textContent = 'Data: idle';
         priceGuideStatusBadges.add(badge);
         return badge;
     }
 
     function createSettingsButton(className) {
         const button = createButton('⚙ Settings', className);
+        button.style.whiteSpace = 'nowrap';
         button.addEventListener('click', openSettingsModal);
         return button;
     }
@@ -252,8 +295,10 @@
             const lineContainer = createLineContainer(false);
             const fetchBtn = createButton('💲', 'line-fetch-button btn', { fontSize: 'small', margin: '2px 0 2px 5px' });
             fetchBtn.addEventListener('click', () => handleFetchButtonClick(row, link, fetchBtn));
-            
-            lineContainer.appendChild(fetchBtn);
+            const graphBtn = createGraphButton();
+            graphBtn.addEventListener('click', () => onGraphButtonClick(row, link, graphBtn));
+
+            lineContainer.append(fetchBtn, graphBtn);
             target.appendChild(lineContainer);
         });
     }
@@ -281,8 +326,11 @@
                     padding: '2px'
                 });
                 fetchBtn.addEventListener('click', () => handleFetchButtonClick(row, link, fetchBtn));
+                const graphBtn = createGraphButton();
+                graphBtn.addEventListener('click', () => onGraphButtonClick(row, link, graphBtn));
+                lineContainer.append(fetchBtn, graphBtn);
 
-                outerDiv.append(oldContentDiv, fetchBtn, lineContainer);
+                outerDiv.append(oldContentDiv, lineContainer);
                 infoCell.appendChild(outerDiv);
             });
         });
@@ -315,14 +363,143 @@
             return;
         }
 
-        loadData(filteredRows, () => {}, { batchButton: clickedButton });
+        const onComplete = isCartPage() ? displayCartTotals : () => {};
+        loadData(filteredRows, onComplete, { batchButton: clickedButton });
+    }
+
+    function displayCartTotals(urlData) {
+        document.querySelectorAll('section[id*="seller"]').forEach(seller => {
+            const articleDiv = seller.querySelector('.item-value')?.parentNode;
+            const totalDiv = seller.querySelector('.strong.total')?.parentNode;
+            const totalValue = parsePrice(seller.querySelector('.strong.total')?.textContent || '0');
+
+            const cartRows = Array.from(seller.querySelectorAll('table.article-table.product-table tbody tr[data-article-id]'));
+            let sellerAverage = 0, sellerTrend = 0;
+            cartRows.forEach(row => {
+                const link = row.querySelector('a[href*="/en/Magic/Products/"]');
+                if (!link) return;
+                const productUrl = buildProductUrl(link.href, [getFoilState(row)]);
+                const data = urlData[productUrl];
+                if (data) {
+                    sellerAverage += data.averagePrice;
+                    sellerTrend += data.trendPrice;
+                }
+            });
+
+            if (articleDiv) {
+                replaceOrInsert(seller, articleDiv, 'value-div',
+                    'Estimated Value',
+                    `30-day: ${sellerAverage.toFixed(2)} € | Trend: ${sellerTrend.toFixed(2)} €`);
+            }
+            if (totalDiv) {
+                replaceOrInsert(seller, totalDiv, 'profit-div',
+                    'Profit',
+                    `30-day: ${(sellerAverage - totalValue).toFixed(2)} € | Trend: ${(sellerTrend - totalValue).toFixed(2)} €`);
+            }
+        });
+
+        const cartDiv = document.querySelector('.card.w-100.cart-overview .card-body');
+        if (!cartDiv) return;
+        const articleValueDiv = cartDiv.querySelector('.item-value')?.parentNode;
+        const totalValueDiv = [...cartDiv.querySelectorAll('.d-flex')].pop();
+        const totalPrice = parsePrice([...(totalValueDiv?.querySelectorAll('span') ?? [])].pop()?.textContent || '0');
+
+        const { trend: totalTrend, average: totalAverage } = sumPrices(urlData);
+
+        if (articleValueDiv) {
+            replaceOrInsert(cartDiv, articleValueDiv, 'value-div',
+                'Est. Value',
+                `30-day: ${totalAverage.toFixed(2)} € | Trend: ${totalTrend.toFixed(2)} €`);
+        }
+        if (totalValueDiv) {
+            replaceOrInsert(cartDiv, totalValueDiv, 'profit-div',
+                'Total Profit',
+                `30-day: ${(totalAverage - totalPrice).toFixed(2)} € | Trend: ${(totalTrend - totalPrice).toFixed(2)} €`);
+        }
+    }
+
+    function createGraphButton() {
+        const btn = createButton('📈', 'graph-btn btn btn-sm', { marginLeft: '3px' });
+        btn.style.opacity = '0.3';
+        btn.title = 'Graph (click to load)';
+        return btn;
+    }
+
+    function setGraphButtonStyle(graphBtn, state) {
+        if (state === 'ready') {
+            graphBtn.style.opacity = '';
+            graphBtn.disabled = false;
+            graphBtn.title = 'Show graph';
+        } else if (state === 'unloaded') {
+            graphBtn.style.opacity = '0.3';
+            graphBtn.disabled = false;
+            graphBtn.title = 'Graph (click to load)';
+        } else if (state === 'loading') {
+            graphBtn.style.opacity = '0.6';
+            graphBtn.disabled = true;
+            graphBtn.title = 'Loading graph...';
+        }
+    }
+
+    function onGraphButtonClick(row, link, graphBtn) {
+        // Once attachDraggableBoxIcon has been called on this button, it owns click handling.
+        if (graphBtn.dataset.graphBound === '1') return;
+
+        const bindAndShow = (htmlStr) => {
+            const chart = createElementFromHTML(htmlStr);
+            const productName = getProductName(row) + (getFoilBool(row) ? ' ⭐' : '');
+            if (typeof unsafeWindow.attachDraggableBoxIcon === 'function') {
+                unsafeWindow.attachDraggableBoxIcon(graphBtn, chart, productName);
+                graphBtn.dataset.graphBound = '1';
+                // Trigger draggable_box's click handler to show the box immediately.
+                graphBtn.dispatchEvent(new MouseEvent('click', { bubbles: false }));
+            }
+        };
+
+        const cached = rowChartHtmlMap.get(row);
+        if (cached) {
+            bindGraphButtonIfReady(row, graphBtn);
+            bindAndShow(cached);
+            return;
+        }
+
+        setGraphButtonStyle(graphBtn, 'loading');
+        const productUrl = buildProductUrl(link.href, [getFoilState(row)]);
+        fetchProductData(productUrl, { row, link })
+            .then(data => {
+                // Also render ratio data on the row if not already shown.
+                processProductPage(data, row);
+                if (data.chartWrapperHTML) {
+                    // rowChartHtmlMap is populated by processProductPage → displayResults.
+                    bindAndShow(data.chartWrapperHTML);
+                } else {
+                    setGraphButtonStyle(graphBtn, 'unloaded');
+                    graphBtn.title = 'No graph available for this product';
+                }
+            })
+            .catch(err => {
+                setGraphButtonStyle(graphBtn, 'unloaded');
+                logError('Error loading graph:', err);
+            });
+    }
+
+    function bindGraphButtonIfReady(row, graphBtn) {
+        if (!graphBtn || graphBtn.dataset.graphBound === '1') return false;
+        const chartHtml = rowChartHtmlMap.get(row);
+        if (!chartHtml || typeof unsafeWindow.attachDraggableBoxIcon !== 'function') return false;
+
+        const chart = createElementFromHTML(chartHtml);
+        const productName = getProductName(row) + (getFoilBool(row) ? ' ⭐' : '');
+        unsafeWindow.attachDraggableBoxIcon(graphBtn, chart, productName);
+        graphBtn.dataset.graphBound = '1';
+        return true;
     }
 
     function handleFetchButtonClick(row, link, fetchBtn) {
         const productUrl = buildProductUrl(link.href, [getFoilState(row)]);
         
         disableButton(fetchBtn, '...');
-        fetchProductData(productUrl)
+        fetchProductData(productUrl, { row, link })
             .then(data => processProductPage(data, row))
             .catch(err => logError('Error fetching product page:', err))
             .finally(() => enableButton(fetchBtn, '💲'));
@@ -330,8 +507,189 @@
 
     // ===== DATA LOADING =====
 
-    function loadDataAsync(articleRows) {
-        return new Promise(resolve => loadData(articleRows, resolve));
+    function runInitialHydration(getRows, onComplete = null, options = {}) {
+        const maxPasses = Number.isFinite(options.maxPasses) ? options.maxPasses : 10;
+        const intervalMs = Number.isFinite(options.intervalMs) ? options.intervalMs : 600;
+        const label = options.label || 'unknown';
+        const hydrationStartedAt = Date.now();
+        let hydrationPassInFlight = false;
+        let hydrationStopped = false;
+        let warmupResolved = false;
+        logPerf(`hydration:${label} start maxPasses=${maxPasses} interval=${intervalMs}ms`);
+        setHydrationButtonsDisabled(true);
+
+        let timer = null;
+        const stopHydration = (reason) => {
+            if (hydrationStopped) return;
+            hydrationStopped = true;
+            if (timer) {
+                clearInterval(timer);
+                timer = null;
+            }
+            setHydrationButtonsDisabled(false);
+            logPerf(`hydration:${label} stopped early (${reason}) at +${Date.now() - hydrationStartedAt}ms`);
+        };
+
+        const hydrateRows = (reason = 'interval', passNumber = 0) => {
+            if (hydrationStopped) {
+                return Promise.resolve({ rows: 0, cacheHits: 0, priceGuideApplied: 0, skipped: true });
+            }
+
+            if (hydrationPassInFlight) {
+                if (passNumber <= 2 || reason !== 'interval' || passNumber === maxPasses) {
+                    logPerf(`hydration:${label} pass=${passNumber} reason=${reason} skipped (previous pass still running)`);
+                }
+                return Promise.resolve({ rows: 0, cacheHits: 0, priceGuideApplied: 0, skipped: true });
+            }
+
+            const passStartedAt = Date.now();
+            const rows = getRows();
+            if (!rows.length) {
+                logPerf(`hydration:${label} pass=${passNumber} reason=${reason} rows=0`);
+                return Promise.resolve({ rows: 0, cacheHits: 0, priceGuideApplied: 0 });
+            }
+
+            hydrationPassInFlight = true;
+            let priceGuideApplied = 0;
+
+            if (priceGuideLookup) {
+                const before = Date.now();
+                priceGuideApplied = applyPriceGuideToRows(rows);
+                const applyDuration = Date.now() - before;
+                if (passNumber <= 2 || reason !== 'interval' || passNumber === maxPasses) {
+                    logPerf(`hydration:${label} pass=${passNumber} reason=${reason} priceGuideApplied=${priceGuideApplied} duration=${applyDuration}ms`);
+                }
+            }
+
+            return autoLoadFromCache(rows, onComplete, { label, reason, passNumber })
+                .then(stats => {
+                    const passDuration = Date.now() - passStartedAt;
+                    if (passNumber <= 2 || reason !== 'interval' || passNumber === maxPasses) {
+                        logPerf(`hydration:${label} pass=${passNumber} reason=${reason} rows=${stats.rows} cacheHits=${stats.cacheHits} duration=${passDuration}ms`);
+                    }
+
+                    if (warmupResolved && !hydrationStopped && (priceGuideApplied > 0 || stats.cacheHits > 0)) {
+                        stopHydration(`warmup-ready cacheHits=${stats.cacheHits} applied=${priceGuideApplied}`);
+                    }
+
+                    return { ...stats, priceGuideApplied };
+                })
+                .catch(error => {
+                    logPerf(`hydration:${label} pass=${passNumber} reason=${reason} autoLoad failed: ${error.message}`);
+                    return { rows: rows.length, cacheHits: 0, priceGuideApplied };
+                })
+                .finally(() => {
+                    hydrationPassInFlight = false;
+                });
+        };
+
+        void hydrateRows('initial', 1);
+
+        let passCount = 0;
+        timer = setInterval(() => {
+            passCount += 1;
+            void hydrateRows('interval', passCount + 1);
+            if (passCount >= maxPasses) {
+                clearInterval(timer);
+                timer = null;
+                setHydrationButtonsDisabled(false);
+                logPerf(`hydration:${label} completed after ${Date.now() - hydrationStartedAt}ms`);
+            }
+        }, intervalMs);
+
+        void warmupPriceGuideData()
+            .then(() => {
+                warmupResolved = true;
+                void hydrateRows('warmup-ready', passCount + 1);
+                logPerf(`hydration:${label} warmup resolved at +${Date.now() - hydrationStartedAt}ms`);
+            })
+            .catch(error => {
+                logError('Price guide preload failed during initial hydration:', error);
+                stopHydration(`warmup-failed: ${error.message}`);
+                logPerf(`hydration:${label} warmup failed at +${Date.now() - hydrationStartedAt}ms: ${error.message}`);
+            });
+    }
+
+    function setHydrationButtonsDisabled(disabled) {
+        const mark = disabled ? '1' : '';
+
+        mainButtons.forEach(button => {
+            if (disabled) {
+                button.dataset.cmHydrationDisabled = mark;
+                button.disabled = true;
+                return;
+            }
+
+            if (button.dataset.cmHydrationDisabled !== '1') return;
+            delete button.dataset.cmHydrationDisabled;
+            if (!isProcessing) {
+                enableButton(button, button.dataset.idleText || button.textContent);
+            }
+        });
+
+        document.querySelectorAll('.line-fetch-button, .graph-btn').forEach(button => {
+            if (disabled) {
+                button.dataset.cmHydrationDisabled = mark;
+                button.disabled = true;
+                return;
+            }
+
+            if (button.dataset.cmHydrationDisabled !== '1') return;
+            delete button.dataset.cmHydrationDisabled;
+            if (button.classList.contains('line-fetch-button')) {
+                enableButton(button, '💲');
+            } else if (button.classList.contains('graph-btn')) {
+                button.disabled = false;
+            }
+        });
+    }
+
+    function autoLoadFromCache(rows, onComplete = null, context = {}) {
+        const urlData = {};
+        const startedAt = Date.now();
+        const rowEntries = rows.map(row => {
+            const link = row.querySelector('a[href*="/en/Magic/Products/"]');
+            if (!link) return null;
+            const productUrl = buildProductUrl(link.href, [getFoilState(row)]);
+            const productContext = resolveProductContext({ row, link }, productUrl);
+            return { row, link, productUrl, productContext };
+        }).filter(Boolean);
+
+        const uniqueIds = rowEntries
+            .map(entry => entry.productContext.idProduct)
+            .filter(Boolean);
+
+        return getProductRecordsByIds(uniqueIds)
+            .then(recordsById => {
+                rowEntries.forEach(entry => {
+                    const { row, link, productUrl, productContext } = entry;
+                    const record = recordsById[productContext.idProduct] || null;
+                    const variant = getVariantRecord(record, productContext.isFoil);
+                    const cachedData = variant?.pageData;
+                    const isFresh = Boolean(variant?.timestamp) && Date.now() - variant.timestamp < getCacheExpirationMs();
+
+                    if (!cachedData || !isFresh || !hasCacheableProductData(cachedData)) return;
+
+                    try {
+                        urlData[productUrl] = processProductPage(cachedData, row);
+                    } catch (err) {
+                        logError(`Error auto-loading cached data for "${link.textContent.trim()}"`, err);
+                    }
+                });
+            })
+            .then(() => {
+                const cacheHits = Object.keys(urlData).length;
+                if (onComplete && cacheHits > 0) onComplete(urlData);
+                if (context.reason !== 'interval' || (context.passNumber || 0) <= 2) {
+                    logPerf(`autoLoad:${context.label || 'unknown'} reason=${context.reason || 'n/a'} pass=${context.passNumber || 0} rows=${rows.length} cacheHits=${cacheHits} duration=${Date.now() - startedAt}ms`);
+                }
+                return { rows: rows.length, cacheHits };
+            })
+            .catch(err => {
+                logError('Error during cache auto-load:', err);
+                logPerf(`autoLoad:${context.label || 'unknown'} failed after ${Date.now() - startedAt}ms: ${err.message}`);
+                return { rows: rows.length, cacheHits: 0 };
+            });
     }
 
     function loadData(articleRows, dataCallback = () => {}, options = {}) {
@@ -343,7 +701,7 @@
             if (!link) return;
 
             const productUrl = buildProductUrl(link.href, [getFoilState(row)]);
-            const cachedData = await checkLocalCache([productUrl, CACHE_VERSION]);
+            const cachedData = await checkLocalCache(productUrl, { row, link });
 
             if (cachedData) {
                 try {
@@ -434,7 +792,7 @@
         const productUrl = buildProductUrl(link.href, [getFoilState(row)]);
         const productName = link.textContent.trim() || "Unknown Product";
 
-        fetchProductData(productUrl)
+        fetchProductData(productUrl, { row, link })
             .then(data => {
                 if (!cancelRequested) {
                     try {
@@ -530,7 +888,7 @@
             const productName = link.textContent.trim() || "Unknown Product";
             inFlight += 1;
 
-            fetchProductData(productUrl)
+            fetchProductData(productUrl, { row, link })
                 .then(data => {
                     if (!cancelRequested) {
                         try {
@@ -624,12 +982,16 @@
         );
         lineContainer.appendChild(innerLiner);
 
-        if (unsafeWindow.attachDraggableBoxIcon && chartHTML) {
-            const chartIcon = createButton('📈', 'btn btn-sm', { marginLeft: '5px' });
-            const productName = getProductName(row) + (getFoilBool(row) ? ' ⭐' : '');
-            const chart = createElementFromHTML(chartHTML);
-            unsafeWindow.attachDraggableBoxIcon(chartIcon, chart, productName);
-            lineContainer.appendChild(chartIcon);
+        // Re-append graphBtn after innerLiner so it appears after the ratio text.
+        const graphBtn = lineContainer.querySelector('.graph-btn');
+        if (graphBtn) lineContainer.appendChild(graphBtn);
+
+        if (chartHTML) {
+            rowChartHtmlMap.set(row, chartHTML);
+            if (graphBtn) {
+                setGraphButtonStyle(graphBtn, 'ready');
+                bindGraphButtonIfReady(row, graphBtn);
+            }
             row.dataset.cmGraphLoaded = '1';
         } else if (!row.dataset.cmGraphLoaded) {
             row.dataset.cmGraphLoaded = '0';
@@ -640,7 +1002,7 @@
         const link = row.querySelector('a[href*="/en/Magic/Products/"]');
         if (!isCartPage()) return link?.textContent.trim() || 'chart';
         
-        const parent = findParentBySelector(row, '.card-body');
+        const parent = row.closest('.card-body');
         const seller = parent?.querySelector('.seller-info a[href*="/en/Magic/Users/"]')?.textContent.trim() || '';
         return seller ? `${seller} - ${link?.textContent.trim() || ''}` : link?.textContent.trim() || 'chart';
     }
@@ -727,8 +1089,8 @@
         GM_log('[cache] Cloudflare gate closed. Resuming queued loads.');
     }
 
-    function fetchProductData(productUrl) {
-        return getCachedData([productUrl, CACHE_VERSION], getCacheExpirationMs(), () => fetchProductDataViaIframe(productUrl));
+    function fetchProductData(productUrl, context = {}) {
+        return getCachedData(productUrl, context, () => fetchProductDataViaIframe(productUrl));
     }
 
     function fetchProductDataViaIframe(productUrl) {
@@ -963,8 +1325,7 @@
             const label = dt.textContent.trim();
             if (label === '30-days average price') {
                 averagePriceText = dt.nextElementSibling?.querySelector('span')?.textContent.trim() || 'N/A';
-            }
-            if (label === 'Price Trend') {
+            } else if (label === 'Price Trend') {
                 trendPriceText = dt.nextElementSibling?.querySelector('span')?.textContent.trim() || 'N/A';
             }
         });
@@ -980,174 +1341,308 @@
         return { averagePriceText, trendPriceText, chartWrapperHTML };
     }
 
-    async function getCachedData(keyParts, expirationMs, fetchCallback) {
-        const storageKey = getProductCacheStorageKey(keyParts);
-        let cachedEntry = null;
-        try {
-            cachedEntry = await getCacheEntry(storageKey);
-        } catch (error) {
-            GM_log(`[cache] Failed to read product cache ${storageKey}: ${error.message}`);
-        }
+    async function getCachedData(productUrl, context, fetchCallback) {
+        const now = Date.now();
+        const expirationMs = getCacheExpirationMs();
+        const productContext = resolveProductContext(context, productUrl);
 
-        if (cachedEntry?.kind === 'product-cache' && cachedEntry.cacheVersion === CACHE_VERSION) {
-            const { timestamp, data } = cachedEntry;
-            if (hasCacheableProductData(data) && Date.now() - timestamp < expirationMs) {
-                return data;
-            }
-
-            if (!hasCacheableProductData(data)) {
-                try {
-                    await deleteCacheEntry(storageKey);
-                } catch (error) {
-                    GM_log(`[cache] Failed to delete invalid cache ${storageKey}: ${error.message}`);
+        if (productContext.idProduct) {
+            try {
+                const record = await getProductRecord(productContext.idProduct);
+                const variant = getVariantRecord(record, productContext.isFoil);
+                if (
+                    variant?.timestamp &&
+                    hasCacheableProductData(variant.pageData) &&
+                    now - variant.timestamp < expirationMs
+                ) {
+                    return variant.pageData;
                 }
+            } catch (error) {
+                GM_log(`[cache] Failed to read unified product cache ${productContext.idProduct}: ${error.message}`);
             }
         }
 
         const freshData = await fetchCallback();
         if (!hasCacheableProductData(freshData)) {
-            throw createRetryableError(`Non-cacheable product data for "${storageKey}"`, 'NON_CACHEABLE_PRODUCT_DATA');
+            throw createRetryableError(`Non-cacheable product data for "${productUrl}"`, 'NON_CACHEABLE_PRODUCT_DATA');
         }
 
-        try {
-            await setCacheEntry(storageKey, {
-                kind: 'product-cache',
-                cacheVersion: CACHE_VERSION,
-                timestamp: Date.now(),
-                data: freshData
-            });
-        } catch (error) {
-            GM_log(`[cache] Failed to persist product cache ${storageKey}: ${error.message}`);
+        const timestamp = Date.now();
+        if (productContext.idProduct) {
+            try {
+                await setUnifiedProductPageData(productContext.idProduct, productContext.isFoil, freshData, timestamp);
+            } catch (error) {
+                GM_log(`[cache] Failed to persist unified cache for ${productContext.idProduct}: ${error.message}`);
+            }
         }
+
         return freshData;
     }
 
-    function setLocalCache(keyParts, data) {
-        const storageKey = getProductCacheStorageKey(keyParts);
-        void setCacheEntry(storageKey, {
-            kind: 'product-cache',
-            cacheVersion: CACHE_VERSION,
-            timestamp: Date.now(),
-            data
-        }).catch(error => GM_log(`[cache] Failed to set local cache ${storageKey}: ${error.message}`));
+    function setLocalCache(productUrl, data, context = {}) {
+        const productContext = resolveProductContext(context, productUrl);
+        const timestamp = Date.now();
+
+        if (productContext.idProduct) {
+            void setUnifiedProductPageData(productContext.idProduct, productContext.isFoil, data, timestamp)
+                .catch(error => GM_log(`[cache] Failed to set unified local cache ${productContext.idProduct}: ${error.message}`));
+        }
     }
 
-    async function checkLocalCache(keyParts) {
-        const storageKey = getProductCacheStorageKey(keyParts);
-        let cachedEntry = null;
+    async function checkLocalCache(productUrl, context = {}) {
+        const productContext = resolveProductContext(context, productUrl);
+        if (!productContext.idProduct) return null;
+
         try {
-            cachedEntry = await getCacheEntry(storageKey);
+            const record = await getProductRecord(productContext.idProduct);
+            const variant = getVariantRecord(record, productContext.isFoil);
+            if (!variant?.pageData) return null;
+            if (Date.now() - variant.timestamp < getCacheExpirationMs()) return variant.pageData;
         } catch (error) {
-            GM_log(`[cache] Failed to read local cache ${storageKey}: ${error.message}`);
-            return null;
-        }
-        if (!cachedEntry?.data) return null;
-
-        const { timestamp, data, cacheVersion } = cachedEntry;
-        if (cacheVersion !== CACHE_VERSION || !hasCacheableProductData(data)) {
-            try {
-                await deleteCacheEntry(storageKey);
-            } catch (error) {
-                GM_log(`[cache] Failed to remove stale cache ${storageKey}: ${error.message}`);
-            }
-            return null;
+            GM_log(`[cache] Failed to read unified local cache ${productContext.idProduct}: ${error.message}`);
         }
 
-        if (Date.now() - timestamp < getCacheExpirationMs()) return data;
         return null;
     }
 
     async function cleanupExpiredCache() {
         const now = Date.now();
-        let removed = 0;
+        let removedUnifiedVariants = 0;
 
         try {
-            await iterateCacheEntries((key, entry, cursor) => {
-                if (!entry || typeof entry !== 'object') {
+            await iterateProductRecords(async (record, cursor) => {
+                if (!record || typeof record !== 'object') {
                     cursor.delete();
-                    removed += 1;
                     return;
                 }
 
-                if (entry.kind !== 'product-cache') return;
-                const isExpired = !entry.timestamp || now - entry.timestamp >= getCacheExpirationMs();
-                const isInvalid = entry.cacheVersion !== CACHE_VERSION || !hasCacheableProductData(entry.data);
-                if (isExpired || isInvalid) {
+                const variants = record.variants && typeof record.variants === 'object' ? record.variants : {};
+                let recordChanged = false;
+
+                ['N', 'Y'].forEach(variantKey => {
+                    const variant = variants[variantKey];
+                    if (!variant) return;
+                    const isExpired = !variant.timestamp || now - variant.timestamp >= getCacheExpirationMs();
+                    const isInvalid = !hasCacheableProductData(variant.pageData);
+                    if (isExpired || isInvalid) {
+                        delete variants[variantKey];
+                        removedUnifiedVariants += 1;
+                        recordChanged = true;
+                    }
+                });
+
+                const hasPriceGuide = Boolean(record.priceGuide && record.priceGuide.cacheVersion === PRICE_GUIDE_CACHE_VERSION);
+                const hasVariants = Boolean(variants.N || variants.Y);
+                if (!hasPriceGuide && !hasVariants) {
                     cursor.delete();
-                    removed += 1;
+                    return;
+                }
+
+                if (recordChanged) {
+                    record.variants = variants;
+                    record.updatedAt = now;
+                    cursor.update(record);
                 }
             });
         } catch (error) {
-            GM_log(`[cache-cleanup] Failed during cleanup: ${error.message}`);
-            return;
+            GM_log(`[cache-cleanup] Failed during unified cleanup: ${error.message}`);
         }
 
-        if (removed > 0) {
-            GM_log(`[cache-cleanup] Removed ${removed} expired product cache entries.`);
+        if (removedUnifiedVariants > 0) {
+            GM_log(`[cache-cleanup] Removed ${removedUnifiedVariants} unified variants.`);
         }
     }
 
-    function getProductCacheStorageKey(keyParts) {
-        return `product-cache|${keyParts.join('|')}`;
+    async function clearAllCachedData() {
+        const db = await openCacheDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction([PRODUCT_CACHE_STORE, META_CACHE_STORE], 'readwrite');
+            tx.objectStore(PRODUCT_CACHE_STORE).clear();
+            tx.objectStore(META_CACHE_STORE).clear();
+
+            tx.oncomplete = () => {
+                priceGuideLookup = null;
+                priceGuideWarmupPromise = null;
+                setPriceGuideStatus('Data: idle', 'neutral');
+
+                getCurrentRows().forEach(row => {
+                    delete row.dataset.cmPriceGuideApplied;
+                    delete row.dataset.cmProductId;
+                    delete row.dataset.cmRatioAvg;
+                    delete row.dataset.cmRatioTrend;
+                    delete row.dataset.cmBestRatio;
+                });
+
+                resolve();
+            };
+            tx.onerror = () => reject(tx.error || new Error('Failed to clear cached data.'));
+        });
+    }
+
+    function getVariantKey(isFoil) {
+        return isFoil ? 'Y' : 'N';
+    }
+
+    function resolveProductContext(context = {}, productUrl = '') {
+        const row = context.row || null;
+        const link = context.link || row?.querySelector('a[href*="/en/Magic/Products/"]') || null;
+        const idProduct = parsePositiveInteger(context.idProduct) || extractProductIdFromRow(row, link);
+
+        let isFoil = Boolean(context.isFoil);
+        if (context.isFoil === undefined) {
+            if (row) {
+                isFoil = getFoilBool(row);
+            } else {
+                const sourceUrl = productUrl || link?.href || '';
+                try {
+                    const parsedUrl = new URL(sourceUrl);
+                    isFoil = parsedUrl.searchParams.get('isFoil') === 'Y';
+                } catch (error) {
+                    isFoil = /(?:[?&])isFoil=Y(?:[&#]|$)/i.test(sourceUrl);
+                }
+            }
+        }
+
+        return {
+            idProduct: parsePositiveInteger(idProduct),
+            isFoil
+        };
+    }
+
+    function getVariantRecord(record, isFoil) {
+        const variantKey = getVariantKey(isFoil);
+        return record?.variants?.[variantKey] || null;
+    }
+
+    async function setUnifiedProductPageData(idProduct, isFoil, pageData, timestamp = Date.now()) {
+        const parsedId = parsePositiveInteger(idProduct);
+        if (!parsedId || !hasCacheableProductData(pageData)) return;
+
+        const existing = await getProductRecord(parsedId);
+        const variants = existing?.variants && typeof existing.variants === 'object' ? { ...existing.variants } : {};
+        variants[getVariantKey(isFoil)] = {
+            timestamp,
+            hasGraph: Boolean(pageData?.chartWrapperHTML),
+            pageData
+        };
+
+        await setProductRecord({
+            idProduct: parsedId,
+            updatedAt: Date.now(),
+            priceGuide: existing?.priceGuide || null,
+            variants
+        });
+    }
+
+    async function loadPriceGuideLookupForRows(rows = getCurrentRows()) {
+        const lookup = {};
+        const uniqueIds = new Set();
+
+        rows.forEach(row => {
+            const link = row.querySelector('a[href*="/en/Magic/Products/"]');
+            if (!link) return;
+            const idProduct = extractProductIdFromRow(row, link);
+            if (idProduct) uniqueIds.add(idProduct);
+        });
+
+        const recordsById = await getProductRecordsByIds(Array.from(uniqueIds));
+
+        Array.from(uniqueIds).forEach(idProduct => {
+            const record = recordsById[idProduct] || null;
+            const priceGuide = record?.priceGuide;
+            if (!priceGuide || priceGuide.cacheVersion !== PRICE_GUIDE_CACHE_VERSION || !priceGuide.values) return;
+            lookup[idProduct] = priceGuide.values;
+        });
+
+        return lookup;
+    }
+
+    async function persistPriceGuideToUnifiedStore(priceGuides, fetchedAt) {
+        await upsertPriceGuideEntries(priceGuides, fetchedAt, PRICE_GUIDE_CACHE_VERSION);
+        await setMetaEntry(PRICE_GUIDE_META_KEY, {
+            cacheVersion: PRICE_GUIDE_CACHE_VERSION,
+            fetchedAt,
+            count: Array.isArray(priceGuides) ? priceGuides.length : 0
+        });
     }
 
     async function warmupPriceGuideData() {
         if (priceGuideWarmupPromise) return priceGuideWarmupPromise;
 
         const warmupPromise = (async () => {
+            const warmupStartedAt = Date.now();
             const now = Date.now();
-            let cachedEntry = null;
+            let meta = null;
             try {
-                cachedEntry = await getCacheEntry(PRICE_GUIDE_CACHE_KEY);
+                const metaStartedAt = Date.now();
+                meta = await getMetaEntry(PRICE_GUIDE_META_KEY);
+                logPerf(`price-guide meta read in ${Date.now() - metaStartedAt}ms; hasMeta=${Boolean(meta)}`);
             } catch (error) {
-                GM_log(`[price-guide] Failed to read cached data: ${error.message}`);
-            }
-            const hasCachedLookup = Boolean(cachedEntry?.kind === 'price-guide-cache' && cachedEntry?.lookup);
-            const isCachedFresh = hasCachedLookup && cachedEntry.cacheVersion === PRICE_GUIDE_CACHE_VERSION &&
-                now - cachedEntry.fetchedAt < getCacheExpirationMs();
-
-            if (hasCachedLookup) {
-                priceGuideLookup = cachedEntry.lookup;
-                applyPriceGuideToRows();
+                GM_log(`[price-guide] Failed to read unified meta: ${error.message}`);
+                logPerf(`price-guide meta read failed in ${Date.now() - warmupStartedAt}ms: ${error.message}`);
             }
 
-            if (isCachedFresh) {
-                setPriceGuideStatus(`Price guide: ready (${formatCacheAge(cachedEntry.fetchedAt)})`, 'ready');
-                return priceGuideLookup;
+            const hasCachedMeta = Boolean(meta?.cacheVersion === PRICE_GUIDE_CACHE_VERSION && Number.isFinite(meta?.fetchedAt));
+            const isCachedFresh = hasCachedMeta && now - meta.fetchedAt < getCacheExpirationMs();
+
+            if (hasCachedMeta) {
+                try {
+                    const cachedLookupStartedAt = Date.now();
+                    const rows = getCurrentRows();
+                    const cachedLookup = await loadPriceGuideLookupForRows(rows);
+                    logPerf(`price-guide row-scoped lookup loaded in ${Date.now() - cachedLookupStartedAt}ms; rows=${rows.length} matchedItems=${Object.keys(cachedLookup).length}`);
+                    if (Object.keys(cachedLookup).length > 0) {
+                        priceGuideLookup = cachedLookup;
+                        applyPriceGuideToRows(rows);
+                        if (isCachedFresh) {
+                            setPriceGuideStatus(`Data: ready (${formatCacheAge(meta.fetchedAt)})`, 'ready');
+                            logPerf(`price-guide warmup satisfied from unified cache in ${Date.now() - warmupStartedAt}ms`);
+                            return priceGuideLookup;
+                        }
+                    }
+                } catch (error) {
+                    GM_log(`[price-guide] Failed loading unified lookup: ${error.message}`);
+                    logPerf(`price-guide unified lookup failed in ${Date.now() - warmupStartedAt}ms: ${error.message}`);
+                }
             }
 
             try {
-                setPriceGuideStatus('Price guide: downloading...', 'loading');
+                setPriceGuideStatus('Data: downloading...', 'loading');
+                const downloadStartedAt = Date.now();
                 const payload = await fetchJsonWithFallback(PRICE_GUIDE_URL);
+                logPerf(`price-guide download complete in ${Date.now() - downloadStartedAt}ms`);
                 if (!Array.isArray(payload?.priceGuides)) {
                     throw new Error('Price guide payload missing "priceGuides" array.');
                 }
 
-                setPriceGuideStatus('Price guide: parsing...', 'loading');
+                setPriceGuideStatus('Data: parsing...', 'loading');
+                const parseStartedAt = Date.now();
                 const lookup = buildPriceGuideLookup(payload.priceGuides);
+                logPerf(`price-guide parse complete in ${Date.now() - parseStartedAt}ms; entries=${payload.priceGuides.length}`);
                 const fetchedAt = Date.now();
                 try {
-                    await setCacheEntry(PRICE_GUIDE_CACHE_KEY, {
-                        kind: 'price-guide-cache',
-                        cacheVersion: PRICE_GUIDE_CACHE_VERSION,
-                        fetchedAt,
-                        lookup
-                    });
+                    const persistStartedAt = Date.now();
+                    await persistPriceGuideToUnifiedStore(payload.priceGuides, fetchedAt);
+                    logPerf(`price-guide persist complete in ${Date.now() - persistStartedAt}ms`);
                 } catch (error) {
-                    GM_log(`[price-guide] Failed to persist data: ${error.message}`);
+                    GM_log(`[price-guide] Failed to persist unified data: ${error.message}`);
+                    logPerf(`price-guide persist failed in ${Date.now() - warmupStartedAt}ms: ${error.message}`);
                 }
 
                 priceGuideLookup = lookup;
                 applyPriceGuideToRows();
-                setPriceGuideStatus(`Price guide: ready (${Object.keys(lookup).length} items)`, 'ready');
+                setPriceGuideStatus(`Data: ready (${Object.keys(lookup).length} items)`, 'ready');
+                logPerf(`price-guide warmup complete in ${Date.now() - warmupStartedAt}ms`);
                 return lookup;
             } catch (error) {
                 if (priceGuideLookup) {
-                    setPriceGuideStatus(`Price guide: stale (${error.message})`, 'warning');
+                    setPriceGuideStatus(`Data: stale (${error.message})`, 'warning');
+                    logPerf(`price-guide warmup stale fallback after ${Date.now() - warmupStartedAt}ms: ${error.message}`);
                     return priceGuideLookup;
                 }
 
-                setPriceGuideStatus(`Price guide: error (${error.message})`, 'error');
+                setPriceGuideStatus(`Data: error (${error.message})`, 'error');
+                logPerf(`price-guide warmup failed after ${Date.now() - warmupStartedAt}ms: ${error.message}`);
                 throw error;
             }
         })();
@@ -1218,7 +1713,17 @@
     }
 
     function extractProductIdFromRow(row, link) {
-        const candidates = [
+        const setAndReturn = (value) => {
+            const parsed = parsePositiveInteger(value);
+            if (!parsed) return null;
+            if (row?.dataset) row.dataset.cmProductId = String(parsed);
+            return parsed;
+        };
+
+        const cachedId = setAndReturn(row?.dataset?.cmProductId);
+        if (cachedId) return cachedId;
+
+        const directCandidates = [
             row?.dataset?.idProduct,
             row?.dataset?.productId,
             row?.getAttribute('data-id-product'),
@@ -1226,18 +1731,63 @@
             link?.dataset?.idProduct,
             link?.dataset?.productId,
             row?.querySelector('input[name="idProduct"]')?.value,
-            row?.querySelector('input[name="productId"]')?.value
+            row?.querySelector('input[name="productId"]')?.value,
+            /(?:[?&])idProduct=(\d+)/i.exec(link?.href || link?.getAttribute('href') || '')?.[1],
+            /(?:[?&])productId=(\d+)/i.exec(link?.href || link?.getAttribute('href') || '')?.[1]
         ];
 
-        const href = link?.getAttribute('href') || '';
-        const hrefIdParam = /(?:[?&])idProduct=(\d+)/i.exec(href)?.[1];
-        const hrefNumericTail = /\/(\d+)(?:[/?#]|$)/.exec(href)?.[1];
-        candidates.push(hrefIdParam, hrefNumericTail);
-
-        for (const value of candidates) {
-            const parsed = parsePositiveInteger(value);
+        for (const candidate of directCandidates) {
+            const parsed = setAndReturn(candidate);
             if (parsed) return parsed;
         }
+
+        const extractFromText = (text) => {
+            if (!text) return null;
+            const patterns = [
+                /(?:^|[?&])idProduct=(\d+)/i,
+                /(?:^|[?&])productId=(\d+)/i,
+                /(?:idProduct|productId|data-id-product|data-product-id)[^0-9]{0,16}(\d{1,12})/i,
+                /product-images\.s3\.cardmarket\.com\/\d+\/[^/]+\/(\d{1,12})\/\1(?:[./?]|$)/i,
+                /\/(\d{5,12})\/\1\.(?:jpg|jpeg|png|webp)(?:[?#]|$)/i
+            ];
+
+            for (const pattern of patterns) {
+                const match = pattern.exec(String(text));
+                const parsed = setAndReturn(match?.[1]);
+                if (parsed) return parsed;
+            }
+
+            return null;
+        };
+
+        const thumbnailTooltip = row?.querySelector('.thumbnail-icon')?.getAttribute('data-bs-title');
+        const tooltipId = extractFromText(thumbnailTooltip);
+        if (tooltipId) return tooltipId;
+
+        const hrefId = extractFromText(link?.href || link?.getAttribute('href') || '');
+        if (hrefId) return hrefId;
+
+        // Last-resort fallback for unusual page variants only.
+        const fallbackNodes = [
+            row,
+            link,
+            row?.querySelector('form'),
+            row?.closest('form'),
+            row?.querySelector('[name*="product" i]'),
+            row?.querySelector('[id*="product" i]')
+        ].filter(Boolean);
+
+        for (const node of fallbackNodes) {
+            for (const attr of Array.from(node.attributes || [])) {
+                if (!/product/i.test(attr.name)) continue;
+                const parsed = extractFromText(attr.value);
+                if (parsed) return parsed;
+            }
+        }
+
+        const rowHtml = row?.innerHTML || '';
+        const htmlParsed = extractFromText(rowHtml);
+        if (htmlParsed) return htmlParsed;
 
         return null;
     }
@@ -1255,10 +1805,20 @@
     }
 
     function parsePositiveInteger(value) {
-        const parsed = Number(value);
-        if (!Number.isFinite(parsed)) return null;
-        const integerValue = Math.round(parsed);
-        return integerValue > 0 ? integerValue : null;
+        if (typeof value === 'number') {
+            return Number.isInteger(value) && value > 0 ? value : null;
+        }
+
+        const rawText = String(value ?? '').trim();
+        if (!rawText) return null;
+
+        const digitsOnly = /^\d+$/.test(rawText)
+            ? rawText
+            : /(?:^|\D)(\d{1,12})(?:\D|$)/.exec(rawText)?.[1];
+        if (!digitsOnly) return null;
+
+        const parsed = Number(digitsOnly);
+        return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
     }
 
     function formatPriceText(value) {
@@ -1293,13 +1853,17 @@
     }
 
     async function fetchJsonWithFallback(url) {
+        const startedAt = Date.now();
         try {
             const response = await fetch(url, { cache: 'no-store' });
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status} while fetching ${url}`);
             }
-            return response.json();
+            const payload = await response.json();
+            logPerf(`fetchJson native fetch succeeded in ${Date.now() - startedAt}ms`);
+            return payload;
         } catch (fetchError) {
+            logPerf(`fetchJson native fetch failed in ${Date.now() - startedAt}ms, trying GM fallback: ${fetchError.message}`);
             return fetchJsonViaGmRequest(url, fetchError);
         }
     }
@@ -1309,6 +1873,7 @@
             return Promise.reject(fallbackError);
         }
 
+        const startedAt = Date.now();
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'GET',
@@ -1321,7 +1886,9 @@
                     }
 
                     try {
-                        resolve(JSON.parse(response.responseText));
+                        const parsed = JSON.parse(response.responseText);
+                        logPerf(`fetchJson GM fallback succeeded in ${Date.now() - startedAt}ms`);
+                        resolve(parsed);
                     } catch (error) {
                         reject(new Error(`Failed to parse JSON from ${url}: ${error.message}`));
                     }
@@ -1345,8 +1912,18 @@
 
             request.onupgradeneeded = () => {
                 const db = request.result;
-                if (!db.objectStoreNames.contains(CACHE_DB_STORE)) {
-                    db.createObjectStore(CACHE_DB_STORE, { keyPath: 'key' });
+                if (db.objectStoreNames.contains('entries')) {
+                    db.deleteObjectStore('entries');
+                }
+                if (!db.objectStoreNames.contains(PRODUCT_CACHE_STORE)) {
+                    const productStore = db.createObjectStore(PRODUCT_CACHE_STORE, { keyPath: 'idProduct' });
+                    productStore.createIndex('updatedAt', 'updatedAt', { unique: false });
+                    productStore.createIndex('priceGuideFetchedAt', 'priceGuide.fetchedAt', { unique: false });
+                    productStore.createIndex('hasGraphNonFoil', 'variants.N.hasGraph', { unique: false });
+                    productStore.createIndex('hasGraphFoil', 'variants.Y.hasGraph', { unique: false });
+                }
+                if (!db.objectStoreNames.contains(META_CACHE_STORE)) {
+                    db.createObjectStore(META_CACHE_STORE, { keyPath: 'key' });
                 }
             };
 
@@ -1357,57 +1934,133 @@
         return cacheDbPromise;
     }
 
-    async function getCacheEntry(key) {
+    async function getProductRecord(idProduct) {
         const db = await openCacheDb();
         return new Promise((resolve, reject) => {
-            const tx = db.transaction(CACHE_DB_STORE, 'readonly');
-            const request = tx.objectStore(CACHE_DB_STORE).get(key);
-            request.onsuccess = () => resolve(request.result?.value || null);
-            request.onerror = () => reject(request.error || new Error(`Failed to read cache key: ${key}`));
+            const tx = db.transaction(PRODUCT_CACHE_STORE, 'readonly');
+            const request = tx.objectStore(PRODUCT_CACHE_STORE).get(idProduct);
+            request.onsuccess = () => resolve(request.result || null);
+            request.onerror = () => reject(request.error || new Error(`Failed to read product cache: ${idProduct}`));
         });
     }
 
-    async function setCacheEntry(key, value) {
+    async function getProductRecordsByIds(idProducts) {
+        const ids = Array.from(new Set((idProducts || []).map(parsePositiveInteger).filter(Boolean)));
+        if (!ids.length) return {};
+
         const db = await openCacheDb();
         return new Promise((resolve, reject) => {
-            const tx = db.transaction(CACHE_DB_STORE, 'readwrite');
-            const request = tx.objectStore(CACHE_DB_STORE).put({ key, value });
+            const tx = db.transaction(PRODUCT_CACHE_STORE, 'readonly');
+            const store = tx.objectStore(PRODUCT_CACHE_STORE);
+            const result = {};
+            let pending = ids.length;
+
+            ids.forEach(idProduct => {
+                const request = store.get(idProduct);
+                request.onsuccess = () => {
+                    result[idProduct] = request.result || null;
+                    pending -= 1;
+                    if (pending === 0) resolve(result);
+                };
+                request.onerror = () => reject(request.error || new Error(`Failed bulk-read for product cache: ${idProduct}`));
+            });
+
+            tx.onerror = () => reject(tx.error || new Error('Failed bulk product read transaction.'));
+        });
+    }
+
+    async function setProductRecord(record) {
+        const db = await openCacheDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(PRODUCT_CACHE_STORE, 'readwrite');
+            const request = tx.objectStore(PRODUCT_CACHE_STORE).put(record);
             request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error || new Error(`Failed to write cache key: ${key}`));
+            request.onerror = () => reject(request.error || new Error(`Failed to write product cache: ${record?.idProduct}`));
         });
     }
 
-    async function deleteCacheEntry(key) {
+    async function iterateProductRecords(onEntry) {
         const db = await openCacheDb();
         return new Promise((resolve, reject) => {
-            const tx = db.transaction(CACHE_DB_STORE, 'readwrite');
-            const request = tx.objectStore(CACHE_DB_STORE).delete(key);
-            request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error || new Error(`Failed to delete cache key: ${key}`));
-        });
-    }
-
-    async function iterateCacheEntries(onEntry) {
-        const db = await openCacheDb();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction(CACHE_DB_STORE, 'readwrite');
-            const store = tx.objectStore(CACHE_DB_STORE);
+            const tx = db.transaction(PRODUCT_CACHE_STORE, 'readwrite');
+            const store = tx.objectStore(PRODUCT_CACHE_STORE);
             const request = store.openCursor();
 
             request.onsuccess = () => {
                 const cursor = request.result;
                 if (!cursor) return;
-                try {
-                    onEntry(cursor.key, cursor.value?.value, cursor);
-                    cursor.continue();
-                } catch (error) {
-                    reject(error);
-                }
+                Promise.resolve(onEntry(cursor.value, cursor))
+                    .then(() => {
+                        cursor.continue();
+                    })
+                    .catch(reject);
             };
 
-            request.onerror = () => reject(request.error || new Error('Failed to iterate cache entries.'));
+            request.onerror = () => reject(request.error || new Error('Failed to iterate product cache records.'));
             tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error || new Error('Failed cache iteration transaction.'));
+            tx.onerror = () => reject(tx.error || new Error('Failed product iteration transaction.'));
+        });
+    }
+
+    async function getMetaEntry(key) {
+        const db = await openCacheDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(META_CACHE_STORE, 'readonly');
+            const request = tx.objectStore(META_CACHE_STORE).get(key);
+            request.onsuccess = () => resolve(request.result?.value || null);
+            request.onerror = () => reject(request.error || new Error(`Failed to read meta cache key: ${key}`));
+        });
+    }
+
+    async function setMetaEntry(key, value) {
+        const db = await openCacheDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(META_CACHE_STORE, 'readwrite');
+            const request = tx.objectStore(META_CACHE_STORE).put({ key, value });
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error || new Error(`Failed to write meta cache key: ${key}`));
+        });
+    }
+
+    async function upsertPriceGuideEntries(priceGuides, fetchedAt, cacheVersion) {
+        const db = await openCacheDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(PRODUCT_CACHE_STORE, 'readwrite');
+            const store = tx.objectStore(PRODUCT_CACHE_STORE);
+
+            priceGuides.forEach(rawEntry => {
+                const idProduct = parsePositiveInteger(rawEntry?.idProduct);
+                if (!idProduct) return;
+
+                const values = {
+                    avg: toNullableNumber(rawEntry.avg),
+                    avg30: toNullableNumber(rawEntry.avg30),
+                    trend: toNullableNumber(rawEntry.trend),
+                    avgFoil: toNullableNumber(rawEntry['avg-foil']),
+                    avg30Foil: toNullableNumber(rawEntry['avg30-foil']),
+                    trendFoil: toNullableNumber(rawEntry['trend-foil'])
+                };
+
+                const getRequest = store.get(idProduct);
+                getRequest.onsuccess = () => {
+                    const existing = getRequest.result || null;
+                    const nextRecord = {
+                        idProduct,
+                        updatedAt: Date.now(),
+                        variants: existing?.variants && typeof existing.variants === 'object' ? existing.variants : {},
+                        priceGuide: {
+                            cacheVersion,
+                            fetchedAt,
+                            values
+                        }
+                    };
+                    store.put(nextRecord);
+                };
+                getRequest.onerror = () => reject(getRequest.error || new Error(`Failed to read product cache during upsert: ${idProduct}`));
+            });
+
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error || new Error('Failed unified price-guide upsert transaction.'));
         });
     }
 
@@ -1581,6 +2234,31 @@
         const actions = document.createElement('div');
         actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;margin-top:12px';
 
+        const clearDataBtn = createButton('Clear Data', 'btn btn-sm btn-outline-danger');
+        clearDataBtn.type = 'button';
+        clearDataBtn.addEventListener('click', async () => {
+            const confirmed = window.confirm('Clear cached price-guide and graph data?');
+            if (!confirmed) return;
+
+            const originalText = clearDataBtn.textContent;
+            clearDataBtn.disabled = true;
+            clearDataBtn.textContent = 'Clearing...';
+
+            try {
+                await clearAllCachedData();
+                errorText.style.color = '#1d6f22';
+                errorText.textContent = 'Cached data cleared.';
+                GM_log('[cache] Cleared all cached data via settings.');
+            } catch (error) {
+                errorText.style.color = '#b00020';
+                errorText.textContent = `Failed to clear data: ${error.message}`;
+                logError('Failed to clear cached data:', error);
+            } finally {
+                clearDataBtn.disabled = false;
+                clearDataBtn.textContent = originalText;
+            }
+        });
+
         const resetBtn = createButton('Defaults', 'btn btn-sm btn-outline-secondary');
         resetBtn.type = 'button';
         resetBtn.addEventListener('click', () => {
@@ -1594,7 +2272,7 @@
         const saveBtn = createButton('Save', 'btn btn-sm btn-primary');
         saveBtn.type = 'submit';
 
-        actions.append(resetBtn, cancelBtn, saveBtn);
+        actions.append(clearDataBtn, resetBtn, cancelBtn, saveBtn);
         form.append(fieldsWrapper, errorText, actions);
 
         form.addEventListener('submit', event => {
@@ -1606,6 +2284,7 @@
             }
 
             saveUserSettings(parsed.values);
+            errorText.style.color = '#b00020';
             errorText.textContent = '';
             settingsModalClose?.();
         });
@@ -1886,17 +2565,10 @@
 
     function clearOldResults(lineContainer) {
         const fetchBtn = lineContainer.querySelector('.line-fetch-button');
+        const graphBtn = lineContainer.querySelector('.graph-btn');
         lineContainer.innerHTML = '';
         if (fetchBtn) lineContainer.appendChild(fetchBtn);
-    }
-
-    function findParentBySelector(elm, selector) {
-        const all = Array.from(document.querySelectorAll(selector));
-        let cur = elm.parentNode;
-        while (cur && !all.includes(cur)) {
-            cur = cur.parentNode;
-        }
-        return cur;
+        if (graphBtn) lineContainer.appendChild(graphBtn);
     }
 
     function disableButton(button, text) {
