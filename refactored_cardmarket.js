@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      4.9
+// @version      5.3
 // @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
@@ -21,20 +21,45 @@
 
     // Constants
     const CACHE_VERSION = 2;
-    const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 hours
-    const REQUEST_DELAY = 1000;
-    const DELAY_INCREMENT_ON_429 = 1000;
-    const IFRAME_LOAD_TIMEOUT_MS = 15000;
-    const IFRAME_READY_TIMEOUT_MS = 5000;
+    const SETTINGS_VERSION = 1;
+    const SETTINGS_STORAGE_KEY = 'cm-refactored-settings';
     const IFRAME_READY_INTERVAL_MS = 250;
-    const IFRAME_MANUAL_TIMEOUT_MS = 5 * 60 * 1000;
     const IFRAME_MANUAL_POLL_INTERVAL_MS = 500;
+    const DEFAULT_SETTINGS = {
+        cacheExpirationHours: 24,
+        requestDelayMs: 1000,
+        queueMode: 'wait_for_load',
+        delayIncrementOn429Ms: 1000,
+        iframeLoadTimeoutMs: 15000,
+        iframeReadyTimeoutMs: 5000,
+        iframeManualTimeoutMinutes: 5
+    };
+    const SETTINGS_FIELDS = [
+        { key: 'cacheExpirationHours', label: 'Cache Expiration (hours)', min: 1, max: 720, step: 1 },
+        { key: 'requestDelayMs', label: 'Request Delay (ms)', min: 100, max: 10000, step: 50 },
+        {
+            key: 'queueMode',
+            label: '$ All Queue Mode',
+            type: 'select',
+            options: [
+                { value: 'wait_for_load', label: 'A) Load -> wait for load -> delay -> next' },
+                { value: 'fixed_delay', label: 'B) Load -> delay -> next (no wait)' }
+            ]
+        },
+        { key: 'delayIncrementOn429Ms', label: '429 Delay Increment (ms)', min: 0, max: 10000, step: 50 },
+        { key: 'iframeLoadTimeoutMs', label: 'Iframe Load Timeout (ms)', min: 1000, max: 120000, step: 500 },
+        { key: 'iframeReadyTimeoutMs', label: 'Iframe Data Timeout (ms)', min: 500, max: 60000, step: 250 },
+        { key: 'iframeManualTimeoutMinutes', label: 'Manual Unblock Timeout (minutes)', min: 1, max: 60, step: 1 }
+    ];
 
     // State
-    let requestDelay = REQUEST_DELAY;
+    let settings = loadUserSettings();
+    let requestDelay = settings.requestDelayMs;
     let isProcessing = false;
     let cancelRequested = false;
     let mainButton;
+    let settingsModal = null;
+    let settingsModalClose = null;
 
     // Initialize
     cleanupExpiredCache();
@@ -106,11 +131,13 @@
     }
 
     function initializeOffersPage() {
+        ensureSettingsModal();
         insertMainButton('.row.g-0.flex-nowrap.align-items-center.pagination.d-none.d-md-flex.mb-2');
         addPerLineFetchButtons('.article-row', '.col-sellerProductInfo');
     }
 
     function initializeCartPage() {
+        ensureSettingsModal();
         insertCartMainButton();
         addCartPerLineFetchButtons();
     }
@@ -124,18 +151,32 @@
         const col3Elements = paginationRow.querySelectorAll('.d-none.d-sm-block.col-3');
         if (col3Elements.length < 2) return;
 
-        mainButton = createButton('💲 All', 'btn btn-primary btn-sm ms-3', { marginLeft: '10px', float: 'right' });
+        const controls = document.createElement('div');
+        controls.style.cssText = 'display:flex;align-items:center;justify-content:flex-end;gap:8px;float:right';
+
+        mainButton = createButton('💲 All', 'btn btn-primary btn-sm');
         mainButton.addEventListener('click', onMainButtonClick);
-        col3Elements[1].appendChild(mainButton);
+        controls.append(mainButton, createSettingsButton('btn btn-secondary btn-sm'));
+        col3Elements[1].appendChild(controls);
     }
 
     function insertCartMainButton() {
         const cardBody = document.querySelector('.card.w-100.cart-overview .card-body.d-flex.flex-column');
         if (!cardBody) return;
 
-        mainButton = createButton('💲 All', 'btn btn-primary btn-sm mt-2');
+        const controls = document.createElement('div');
+        controls.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:8px';
+
+        mainButton = createButton('💲 All', 'btn btn-primary btn-sm');
         mainButton.addEventListener('click', onCartMainButtonClick);
-        cardBody.appendChild(mainButton);
+        controls.append(mainButton, createSettingsButton('btn btn-secondary btn-sm'));
+        cardBody.appendChild(controls);
+    }
+
+    function createSettingsButton(className) {
+        const button = createButton('⚙ Settings', className);
+        button.addEventListener('click', openSettingsModal);
+        return button;
     }
 
     function addPerLineFetchButtons(rowSelector, targetSelector) {
@@ -299,6 +340,14 @@
     }
 
     function processQueue(queue, finishCallback, progressData = {}) {
+        if (settings.queueMode === 'fixed_delay') {
+            return processQueueWithFixedDelay(queue, finishCallback, progressData);
+        }
+
+        return processQueueWaitForLoad(queue, finishCallback, progressData);
+    }
+
+    function processQueueWaitForLoad(queue, finishCallback, progressData = {}) {
         if (queue.length === 0 || cancelRequested) {
             if (queue.length === 0 && finishCallback) finishCallback(progressData);
             return finishProcessing();
@@ -306,7 +355,7 @@
 
         const row = queue.shift();
         const link = row.querySelector('a[href*="/en/Magic/Products/"]');
-        if (!link) return processQueue(queue, finishCallback, progressData);
+        if (!link) return processQueueWaitForLoad(queue, finishCallback, progressData);
 
         const productUrl = buildProductUrl(link.href, [getFoilState(row)]);
         const productName = link.textContent.trim() || "Unknown Product";
@@ -324,7 +373,7 @@
             .catch(err => {
                 if (!cancelRequested) {
                     if (/Non-200 response: 429/.test(err.message)) {
-                        requestDelay += DELAY_INCREMENT_ON_429;
+                        requestDelay += settings.delayIncrementOn429Ms;
                         queue.push(row); // Retry later
                     } else {
                         logError(`Error fetching "${productName}":`, err);
@@ -333,11 +382,96 @@
             })
             .finally(() => {
                 if (!cancelRequested) {
-                    setTimeout(() => processQueue(queue, finishCallback, progressData), requestDelay);
+                    setTimeout(() => processQueueWaitForLoad(queue, finishCallback, progressData), requestDelay);
                 } else {
                     finishProcessing();
                 }
             });
+    }
+
+    function processQueueWithFixedDelay(queue, finishCallback, progressData = {}) {
+        let inFlight = 0;
+        let dispatchTimer = null;
+        let finished = false;
+
+        const maybeFinish = () => {
+            if (finished) return;
+
+            if (cancelRequested) {
+                finished = true;
+                if (dispatchTimer) clearTimeout(dispatchTimer);
+                finishProcessing();
+                return;
+            }
+
+            if (queue.length === 0 && inFlight === 0) {
+                finished = true;
+                if (finishCallback) finishCallback(progressData);
+                finishProcessing();
+            }
+        };
+
+        const scheduleNext = (delayMs) => {
+            if (finished || cancelRequested || dispatchTimer || queue.length === 0) return;
+            dispatchTimer = setTimeout(dispatchNext, delayMs);
+        };
+
+        const dispatchNext = () => {
+            dispatchTimer = null;
+            if (finished || cancelRequested) {
+                maybeFinish();
+                return;
+            }
+
+            if (queue.length === 0) {
+                maybeFinish();
+                return;
+            }
+
+            const row = queue.shift();
+            const link = row.querySelector('a[href*="/en/Magic/Products/"]');
+            if (!link) {
+                scheduleNext(requestDelay);
+                maybeFinish();
+                return;
+            }
+
+            const productUrl = buildProductUrl(link.href, [getFoilState(row)]);
+            const productName = link.textContent.trim() || "Unknown Product";
+            inFlight += 1;
+
+            fetchProductData(productUrl)
+                .then(data => {
+                    if (!cancelRequested) {
+                        try {
+                            progressData[productUrl] = processProductPage(data, row);
+                        } catch (e) {
+                            logError(`Error processing "${productName}":`, e);
+                        }
+                    }
+                })
+                .catch(err => {
+                    if (!cancelRequested) {
+                        if (/Non-200 response: 429/.test(err.message)) {
+                            requestDelay += settings.delayIncrementOn429Ms;
+                            queue.push(row); // Retry later
+                        } else {
+                            logError(`Error fetching "${productName}":`, err);
+                        }
+                    }
+                })
+                .finally(() => {
+                    inFlight -= 1;
+                    if (!cancelRequested) {
+                        scheduleNext(requestDelay);
+                    }
+                    maybeFinish();
+                });
+
+            scheduleNext(requestDelay);
+        };
+
+        dispatchNext();
     }
 
     // ===== DATA PROCESSING =====
@@ -422,7 +556,7 @@
     // ===== FETCHING & CACHING =====
 
     function fetchProductData(productUrl) {
-        return getCachedData([productUrl, CACHE_VERSION], CACHE_EXPIRATION_MS, () => fetchProductDataViaIframe(productUrl));
+        return getCachedData([productUrl, CACHE_VERSION], getCacheExpirationMs(), () => fetchProductDataViaIframe(productUrl));
     }
 
     function fetchProductDataViaIframe(productUrl) {
@@ -484,7 +618,7 @@
                         return finalize(resolve, state.data);
                     }
 
-                    if (Date.now() - startedAt >= IFRAME_MANUAL_TIMEOUT_MS) {
+                    if (Date.now() - startedAt >= getIframeManualTimeoutMs()) {
                         return finalize(reject, new Error(`Manual unblock timeout for "${productUrl}"`));
                     }
                 }, IFRAME_MANUAL_POLL_INTERVAL_MS);
@@ -514,7 +648,7 @@
                         return startManualUnblockMode();
                     }
 
-                    if (Date.now() - startedAt >= IFRAME_READY_TIMEOUT_MS) {
+                    if (Date.now() - startedAt >= settings.iframeReadyTimeoutMs) {
                         GM_log(`[cache] Iframe data timeout for ${productUrl}, using best available data.`);
                         return finalize(resolve, lastData);
                     }
@@ -525,7 +659,7 @@
 
             loadTimeout = setTimeout(() => {
                 finalize(reject, new Error(`Iframe load timeout for "${productUrl}"`));
-            }, IFRAME_LOAD_TIMEOUT_MS);
+            }, settings.iframeLoadTimeoutMs);
 
             iframe.addEventListener('load', onLoad);
             iframe.addEventListener('error', onError);
@@ -670,7 +804,7 @@
 
         try {
             const { timestamp, data } = JSON.parse(cachedString);
-            if (Date.now() - timestamp < CACHE_EXPIRATION_MS) return data;
+            if (Date.now() - timestamp < getCacheExpirationMs()) return data;
         } catch (err) {
             console.warn(`Failed to parse cached data for key: ${storageKey}`, err);
         }
@@ -688,7 +822,7 @@
                 const cachedString = localStorage.getItem(key);
                 try {
                     const { timestamp } = JSON.parse(cachedString);
-                    if (timestamp && now - timestamp >= CACHE_EXPIRATION_MS) {
+                    if (timestamp && now - timestamp >= getCacheExpirationMs()) {
                         keysToRemove.push(key);
                     }
                 } catch (err) {
@@ -701,6 +835,252 @@
         if (keysToRemove.length > 0) {
             console.log(`[cache-cleanup] Removed ${keysToRemove.length} expired entries.`);
         }
+    }
+
+    // ===== SETTINGS =====
+
+    function loadUserSettings() {
+        const stored = localStorage.getItem(SETTINGS_STORAGE_KEY);
+        if (!stored) return { ...DEFAULT_SETTINGS };
+
+        try {
+            const parsed = JSON.parse(stored);
+            const source = parsed?.version === SETTINGS_VERSION && parsed?.data ? parsed.data : parsed;
+            return sanitizeSettings(source);
+        } catch (error) {
+            GM_log(`[settings] Failed to parse saved settings. Falling back to defaults. ${error.message}`);
+            return { ...DEFAULT_SETTINGS };
+        }
+    }
+
+    function sanitizeSettings(candidate) {
+        const source = candidate && typeof candidate === 'object' ? candidate : {};
+        return {
+            cacheExpirationHours: sanitizeInteger(source.cacheExpirationHours, DEFAULT_SETTINGS.cacheExpirationHours, 1, 720),
+            requestDelayMs: sanitizeInteger(source.requestDelayMs, DEFAULT_SETTINGS.requestDelayMs, 100, 10000),
+            queueMode: sanitizeQueueMode(source.queueMode),
+            delayIncrementOn429Ms: sanitizeInteger(source.delayIncrementOn429Ms, DEFAULT_SETTINGS.delayIncrementOn429Ms, 0, 10000),
+            iframeLoadTimeoutMs: sanitizeInteger(source.iframeLoadTimeoutMs, DEFAULT_SETTINGS.iframeLoadTimeoutMs, 1000, 120000),
+            iframeReadyTimeoutMs: sanitizeInteger(source.iframeReadyTimeoutMs, DEFAULT_SETTINGS.iframeReadyTimeoutMs, 500, 60000),
+            iframeManualTimeoutMinutes: sanitizeInteger(source.iframeManualTimeoutMinutes, DEFAULT_SETTINGS.iframeManualTimeoutMinutes, 1, 60)
+        };
+    }
+
+    function sanitizeInteger(value, fallback, min, max) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return fallback;
+        return Math.min(max, Math.max(min, Math.round(parsed)));
+    }
+
+    function sanitizeQueueMode(value) {
+        return value === 'fixed_delay' ? 'fixed_delay' : 'wait_for_load';
+    }
+
+    function saveUserSettings(nextSettings) {
+        settings = sanitizeSettings(nextSettings);
+        requestDelay = settings.requestDelayMs;
+        localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({
+            version: SETTINGS_VERSION,
+            timestamp: Date.now(),
+            data: settings
+        }));
+        cleanupExpiredCache();
+    }
+
+    function getCacheExpirationMs() {
+        return settings.cacheExpirationHours * 60 * 60 * 1000;
+    }
+
+    function getIframeManualTimeoutMs() {
+        return settings.iframeManualTimeoutMinutes * 60 * 1000;
+    }
+
+    function ensureSettingsModal() {
+        if (settingsModal) return;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'cm-settings-modal';
+        overlay.style.cssText = [
+            'position:fixed',
+            'inset:0',
+            'display:none',
+            'align-items:center',
+            'justify-content:center',
+            'padding:16px',
+            'background:rgba(0, 0, 0, 0.55)',
+            'z-index:2147483647'
+        ].join(';');
+
+        const panel = document.createElement('div');
+        panel.style.cssText = [
+            'width:min(560px, 100%)',
+            'max-height:calc(100vh - 32px)',
+            'overflow:auto',
+            'padding:16px',
+            'border-radius:8px',
+            'background:#fff',
+            'border:1px solid #ccc',
+            'font:14px/1.4 sans-serif',
+            'box-shadow:0 12px 30px rgba(0,0,0,0.25)'
+        ].join(';');
+
+        const title = document.createElement('h3');
+        title.textContent = 'Cardmarket Script Settings';
+        title.style.cssText = 'margin:0 0 6px 0;font-size:18px';
+
+        const subtitle = document.createElement('p');
+        subtitle.textContent = 'These values are saved to localStorage and reused on future page loads.';
+        subtitle.style.cssText = 'margin:0 0 14px 0;color:#555';
+
+        const form = document.createElement('form');
+        form.noValidate = true;
+
+        const fieldsWrapper = document.createElement('div');
+        fieldsWrapper.style.cssText = 'display:grid;gap:10px';
+
+        SETTINGS_FIELDS.forEach(field => {
+            const row = document.createElement('label');
+            row.style.cssText = 'display:grid;gap:4px';
+
+            const labelText = document.createElement('span');
+            labelText.textContent = field.label;
+            labelText.style.cssText = 'font-size:13px;font-weight:600;color:#333';
+
+            let control;
+            if (field.type === 'select') {
+                const select = document.createElement('select');
+                select.name = field.key;
+                select.required = true;
+                select.style.cssText = 'padding:6px 8px;border:1px solid #bbb;border-radius:4px;background:#fff';
+
+                field.options.forEach(option => {
+                    const optionElement = document.createElement('option');
+                    optionElement.value = option.value;
+                    optionElement.textContent = option.label;
+                    select.appendChild(optionElement);
+                });
+
+                control = select;
+            } else {
+                const input = document.createElement('input');
+                input.type = 'number';
+                input.name = field.key;
+                input.min = String(field.min);
+                input.max = String(field.max);
+                input.step = String(field.step);
+                input.required = true;
+                input.style.cssText = 'padding:6px 8px;border:1px solid #bbb;border-radius:4px';
+                control = input;
+            }
+
+            row.append(labelText, control);
+            fieldsWrapper.appendChild(row);
+        });
+
+        const errorText = document.createElement('div');
+        errorText.className = 'cm-settings-error';
+        errorText.style.cssText = 'min-height:18px;margin-top:10px;color:#b00020;font-size:12px';
+
+        const actions = document.createElement('div');
+        actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;margin-top:12px';
+
+        const resetBtn = createButton('Defaults', 'btn btn-sm btn-outline-secondary');
+        resetBtn.type = 'button';
+        resetBtn.addEventListener('click', () => {
+            populateSettingsForm(DEFAULT_SETTINGS);
+        });
+
+        const cancelBtn = createButton('Cancel', 'btn btn-sm btn-secondary');
+        cancelBtn.type = 'button';
+        cancelBtn.addEventListener('click', () => settingsModalClose?.());
+
+        const saveBtn = createButton('Save', 'btn btn-sm btn-primary');
+        saveBtn.type = 'submit';
+
+        actions.append(resetBtn, cancelBtn, saveBtn);
+        form.append(fieldsWrapper, errorText, actions);
+
+        form.addEventListener('submit', event => {
+            event.preventDefault();
+            const parsed = parseSettingsForm();
+            if (parsed.error) {
+                errorText.textContent = parsed.error;
+                return;
+            }
+
+            saveUserSettings(parsed.values);
+            errorText.textContent = '';
+            settingsModalClose?.();
+        });
+
+        overlay.addEventListener('click', event => {
+            if (event.target === overlay) {
+                settingsModalClose?.();
+            }
+        });
+
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape' && settingsModal?.style.display !== 'none') {
+                settingsModalClose?.();
+            }
+        });
+
+        panel.append(title, subtitle, form);
+        overlay.appendChild(panel);
+        (document.body || document.documentElement).appendChild(overlay);
+
+        settingsModal = overlay;
+        settingsModalClose = () => {
+            settingsModal.style.display = 'none';
+            document.body.style.overflow = '';
+        };
+    }
+
+    function openSettingsModal() {
+        ensureSettingsModal();
+        populateSettingsForm(settings);
+        settingsModal.style.display = 'flex';
+        document.body.style.overflow = 'hidden';
+    }
+
+    function populateSettingsForm(values) {
+        SETTINGS_FIELDS.forEach(field => {
+            const control = settingsModal?.querySelector(`[name="${field.key}"]`);
+            if (control) control.value = String(values[field.key]);
+        });
+
+        const errorText = settingsModal?.querySelector('.cm-settings-error');
+        if (errorText) errorText.textContent = '';
+    }
+
+    function parseSettingsForm() {
+        const values = {};
+
+        for (const field of SETTINGS_FIELDS) {
+            const control = settingsModal?.querySelector(`[name="${field.key}"]`);
+            if (!control) {
+                return { error: 'Settings form is unavailable.' };
+            }
+
+            if (field.type === 'select') {
+                const value = String(control.value || '');
+                const allowedValues = field.options.map(option => option.value);
+                if (!allowedValues.includes(value)) {
+                    return { error: `${field.label} has an invalid value.` };
+                }
+                values[field.key] = value;
+                continue;
+            }
+
+            const value = Number(control.value);
+            if (!Number.isFinite(value) || value < field.min || value > field.max) {
+                return { error: `${field.label} must be between ${field.min} and ${field.max}.` };
+            }
+
+            values[field.key] = Math.round(value);
+        }
+
+        return { values };
     }
 
     // ===== DOM CREATION HELPERS =====
@@ -848,7 +1228,7 @@
 
     function finishProcessing() {
         isProcessing = false;
-        requestDelay = REQUEST_DELAY;
+        requestDelay = settings.requestDelayMs;
         enableButton(mainButton, '💲 All');
         document.querySelectorAll('.line-fetch-button').forEach(btn => enableButton(btn, '💲'));
         GM_log('Processing finished or canceled.');
