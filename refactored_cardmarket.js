@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      5.7
-// @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
+// @version      5.9
+// @description  Preloads daily price-guide data, renders ratios immediately, and loads graphs on demand.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
 // @supportURL   https://github.com/mfiferna/cm-scripts/issues
@@ -12,7 +12,9 @@
 // @match        https://www.cardmarket.com/en/Magic/ShoppingCart
 // @match        https://www.cardmarket.com/en/Magic/Products/Singles/*/*
 // @grant        GM_log
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      downloads.s3.cardmarket.com
 // @run-at       document-start
 // ==/UserScript==
 
@@ -20,13 +22,20 @@
     'use strict';
 
     // Constants
-    const CACHE_VERSION = 2;
-    const SETTINGS_VERSION = 1;
+    const CACHE_VERSION = 3;
+    const PRICE_GUIDE_CACHE_VERSION = 1;
+    const SETTINGS_VERSION = 2;
     const SETTINGS_STORAGE_KEY = 'cm-refactored-settings';
+    const PRICE_GUIDE_URL = 'https://downloads.s3.cardmarket.com/productCatalog/priceGuide/price_guide_1.json';
+    const PRICE_GUIDE_CACHE_KEY = `cm-price-guide-cache|${PRICE_GUIDE_CACHE_VERSION}`;
+    const CACHE_DB_NAME = 'cm-refactored-cache-db';
+    const CACHE_DB_VERSION = 1;
+    const CACHE_DB_STORE = 'entries';
     const IFRAME_READY_INTERVAL_MS = 250;
     const IFRAME_MANUAL_POLL_INTERVAL_MS = 500;
     const DEFAULT_SETTINGS = {
         cacheExpirationHours: 24,
+        graphRatioThreshold: 1,
         requestDelayMs: 1000,
         maxInFlightRequests: 0,
         delayRandomizationPercent: 15,
@@ -38,12 +47,13 @@
     };
     const SETTINGS_FIELDS = [
         { key: 'cacheExpirationHours', label: 'Cache Expiration (hours)', min: 1, max: 720, step: 1 },
+        { key: 'graphRatioThreshold', label: 'Graph Ratio Threshold (x)', min: 0.5, max: 5, step: 0.05, allowFloat: true },
         { key: 'requestDelayMs', label: 'Request Delay (ms)', min: 100, max: 10000, step: 50 },
         { key: 'maxInFlightRequests', label: 'Max In-Flight Requests (0 = unlimited)', min: 0, max: 100, step: 1 },
         { key: 'delayRandomizationPercent', label: 'Delay Randomization (+/- %)', min: 0, max: 100, step: 1 },
         {
             key: 'queueMode',
-            label: '$ All Queue Mode',
+            label: 'Graph Queue Mode',
             type: 'select',
             options: [
                 { value: 'wait_for_load', label: 'A) Load -> wait for load -> delay -> next' },
@@ -61,15 +71,20 @@
     let requestDelay = settings.requestDelayMs;
     let isProcessing = false;
     let cancelRequested = false;
-    let mainButton;
+    let mainButtons = [];
+    let activeMainButton = null;
     let settingsModal = null;
     let settingsModalClose = null;
     let activeIframeRequests = new Set();
     let nextIframeRequestId = 1;
     let cloudflareGate = null;
+    let priceGuideLookup = null;
+    let priceGuideWarmupPromise = null;
+    let cacheDbPromise = null;
+    const priceGuideStatusBadges = new Set();
 
     // Initialize
-    cleanupExpiredCache();
+    void cleanupExpiredCache();
     document.addEventListener('DOMContentLoaded', init);
 
     // ===== INITIALIZATION =====
@@ -141,12 +156,14 @@
         ensureSettingsModal();
         insertMainButton('.row.g-0.flex-nowrap.align-items-center.pagination.d-none.d-md-flex.mb-2');
         addPerLineFetchButtons('.article-row', '.col-sellerProductInfo');
+        void warmupPriceGuideData();
     }
 
     function initializeCartPage() {
         ensureSettingsModal();
         insertCartMainButton();
         addCartPerLineFetchButtons();
+        void warmupPriceGuideData();
     }
 
     // ===== BUTTON CREATION =====
@@ -160,10 +177,16 @@
 
         const controls = document.createElement('div');
         controls.style.cssText = 'display:flex;align-items:center;justify-content:flex-end;gap:8px;float:right';
-
-        mainButton = createButton('💲 All', 'btn btn-primary btn-sm');
-        mainButton.addEventListener('click', onMainButtonClick);
-        controls.append(mainButton, createSettingsButton('btn btn-secondary btn-sm'));
+        const allGraphsButton = createMainBatchButton('💲 All Graphs', 'btn btn-primary btn-sm', 'graphs-all', () =>
+            onMainGraphButtonClick(getOfferRows(), null, allGraphsButton)
+        );
+        const thresholdButton = createMainBatchButton(
+            `💲 >= ${formatRatioThreshold(settings.graphRatioThreshold)}x`,
+            'btn btn-outline-primary btn-sm',
+            'graphs-threshold',
+            () => onMainGraphButtonClick(getOfferRows(), settings.graphRatioThreshold, thresholdButton)
+        );
+        controls.append(allGraphsButton, thresholdButton, createPriceGuideStatusBadge(), createSettingsButton('btn btn-secondary btn-sm'));
         col3Elements[1].appendChild(controls);
     }
 
@@ -173,11 +196,45 @@
 
         const controls = document.createElement('div');
         controls.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:8px';
-
-        mainButton = createButton('💲 All', 'btn btn-primary btn-sm');
-        mainButton.addEventListener('click', onCartMainButtonClick);
-        controls.append(mainButton, createSettingsButton('btn btn-secondary btn-sm'));
+        const allGraphsButton = createMainBatchButton('💲 All Graphs', 'btn btn-primary btn-sm', 'graphs-all', () =>
+            onMainGraphButtonClick(getCartRows(), null, allGraphsButton)
+        );
+        const thresholdButton = createMainBatchButton(
+            `💲 >= ${formatRatioThreshold(settings.graphRatioThreshold)}x`,
+            'btn btn-outline-primary btn-sm',
+            'graphs-threshold',
+            () => onMainGraphButtonClick(getCartRows(), settings.graphRatioThreshold, thresholdButton)
+        );
+        controls.append(allGraphsButton, thresholdButton, createPriceGuideStatusBadge(), createSettingsButton('btn btn-secondary btn-sm'));
         cardBody.appendChild(controls);
+    }
+
+    function createMainBatchButton(text, className, role, onClick) {
+        const button = createButton(text, className);
+        button.dataset.role = role;
+        button.dataset.idleText = text;
+        button.addEventListener('click', onClick);
+        mainButtons.push(button);
+        return button;
+    }
+
+    function createPriceGuideStatusBadge() {
+        const badge = document.createElement('span');
+        badge.style.cssText = [
+            'display:inline-flex',
+            'align-items:center',
+            'height:31px',
+            'padding:0 8px',
+            'border-radius:4px',
+            'font-size:12px',
+            'border:1px solid #bbb',
+            'background:#f7f7f7',
+            'color:#555',
+            'white-space:nowrap'
+        ].join(';');
+        badge.textContent = 'Price guide: idle';
+        priceGuideStatusBadges.add(badge);
+        return badge;
     }
 
     function createSettingsButton(className) {
@@ -233,70 +290,32 @@
 
     // ===== MAIN CLICK HANDLERS =====
 
-    function onMainButtonClick() {
+    async function onMainGraphButtonClick(rows, minRatio, clickedButton) {
         if (isProcessing) return requestCancellation();
+        if (!rows.length) return logError('No article rows found to process.');
 
-        const articleRows = Array.from(document.querySelectorAll('.article-row'));
-        if (!articleRows.length) return logError('No article rows found to process.');
-
-        loadData(articleRows);
-    }
-
-    async function onCartMainButtonClick() {
-        const sellers = document.querySelectorAll('section[id*="seller"]');
-        const sellerData = {};
-
-        for (const seller of sellers) {
-            const articleDiv = seller.querySelector('.item-value')?.parentNode;
-            const totalDiv = seller.querySelector('.strong.total')?.parentNode;
-            const totalValue = parsePrice(seller.querySelector('.strong.total')?.textContent || '0');
-
-            const cartRows = Array.from(seller.querySelectorAll('table.article-table.product-table tbody tr[data-article-id]'));
-            if (!cartRows.length) continue;
-
-            const urlData = await loadDataAsync(cartRows);
-            sellerData[seller.id] = urlData;
-
-            const { trend, average } = sumPrices(urlData);
-
-            if (articleDiv) {
-                replaceOrInsert(seller, articleDiv, 'value-div', 
-                    `Estimated Value`, 
-                    `30-day: ${average.toFixed(2)}€ | Trend: ${trend.toFixed(2)} €`);
-            }
-
-            if (totalDiv) {
-                replaceOrInsert(seller, totalDiv, 'profit-div',
-                    `Profit`,
-                    `30-day: ${(average - totalValue).toFixed(2)} € | Trend: ${(trend - totalValue).toFixed(2)} €`);
+        if (!priceGuideLookup) {
+            try {
+                await warmupPriceGuideData();
+            } catch (error) {
+                logError('Price guide preload failed:', error);
             }
         }
 
-        displayCartTotals(sellerData);
-    }
+        if (priceGuideLookup) {
+            applyPriceGuideToRows(rows);
+        }
 
-    function displayCartTotals(sellerData) {
-        const cartDiv = document.querySelector('.card.w-100.cart-overview .card-body');
-        const articleValueDiv = cartDiv.querySelector('.item-value').parentNode;
-        const totalValueDiv = [...cartDiv.querySelectorAll('.d-flex')].pop();
-        const totalPrice = parsePrice([...totalValueDiv.querySelectorAll('span')].pop().textContent);
+        const filteredRows = Number.isFinite(minRatio)
+            ? rows.filter(row => getRowBestRatio(row) >= minRatio)
+            : rows;
 
-        let totalTrend = 0, totalAverage = 0;
-        Object.values(sellerData).forEach(data => {
-            const { trend, average } = sumPrices(data);
-            totalTrend += trend;
-            totalAverage += average;
-        });
+        if (!filteredRows.length) {
+            GM_log(`[graphs] No rows matched the ${formatRatioThreshold(minRatio)}x threshold.`);
+            return;
+        }
 
-        replaceOrInsert(cartDiv, articleValueDiv, 'value-div',
-            `Est. Value`,
-            `30-day: ${totalAverage.toFixed(2)}€ | Trend: ${totalTrend.toFixed(2)} €`);
-
-        replaceOrInsert(cartDiv, totalValueDiv, 'profit-div',
-            `Total Profit`,
-            `30-day: ${(totalAverage - totalPrice).toFixed(2)} € | Trend: ${(totalTrend - totalPrice).toFixed(2)} €`);
-
-        GM_log('Seller Data:', sellerData);
+        loadData(filteredRows, () => {}, { batchButton: clickedButton });
     }
 
     function handleFetchButtonClick(row, link, fetchBtn) {
@@ -315,16 +334,16 @@
         return new Promise(resolve => loadData(articleRows, resolve));
     }
 
-    function loadData(articleRows, dataCallback = () => {}) {
+    function loadData(articleRows, dataCallback = () => {}, options = {}) {
         const rowData = {};
         const fetchNeeded = [];
 
-        for (const row of articleRows) {
+        Promise.all(articleRows.map(async row => {
             const link = row.querySelector('a[href*="/en/Magic/Products/"]');
-            if (!link) continue;
+            if (!link) return;
 
             const productUrl = buildProductUrl(link.href, [getFoilState(row)]);
-            const cachedData = checkLocalCache([productUrl, CACHE_VERSION]);
+            const cachedData = await checkLocalCache([productUrl, CACHE_VERSION]);
 
             if (cachedData) {
                 try {
@@ -332,18 +351,24 @@
                 } catch (err) {
                     logError(`Error processing cached data for "${link.textContent.trim()}"`, err);
                 }
-            } else {
-                fetchNeeded.push(row);
+                return;
             }
-        }
 
-        if (fetchNeeded.length > 0) {
-            startProcessing(fetchNeeded);
-            processQueue(fetchNeeded, data => dataCallback({ ...data, ...rowData }));
-        } else {
-            GM_log('All items satisfied via cache.');
-            dataCallback(rowData);
-        }
+            fetchNeeded.push(row);
+        }))
+            .then(() => {
+                if (fetchNeeded.length > 0) {
+                    startProcessing(fetchNeeded, options.batchButton || null);
+                    processQueue(fetchNeeded, data => dataCallback({ ...data, ...rowData }));
+                } else {
+                    GM_log('All items satisfied via cache.');
+                    dataCallback(rowData);
+                }
+            })
+            .catch(err => {
+                logError('Error preparing queued requests:', err);
+                dataCallback(rowData);
+            });
     }
 
     function createRetryableError(message, code) {
@@ -541,8 +566,21 @@
         const averagePrice = parsePrice(data.averagePriceText) * quantity;
         const trendPrice = parsePrice(data.trendPriceText) * quantity;
         const sellerPrice = getSellerPrice(row) * quantity;
+        const averageRatio = averagePrice / sellerPrice;
+        const trendRatio = trendPrice / sellerPrice;
 
-        displayResults(row, averagePrice, trendPrice, sellerPrice, data.averagePriceText, data.trendPriceText, data.chartWrapperHTML);
+        setRowRatios(row, averageRatio, trendRatio);
+        displayResults(
+            row,
+            averagePrice,
+            trendPrice,
+            sellerPrice,
+            averageRatio,
+            trendRatio,
+            data.averagePriceText,
+            data.trendPriceText,
+            data.chartWrapperHTML
+        );
 
         return {
             averagePrice,
@@ -550,7 +588,9 @@
             trendPrice,
             trendPriceText: data.trendPriceText,
             sellerPrice,
-            quantity
+            quantity,
+            averageRatio,
+            trendRatio
         };
     }
 
@@ -571,7 +611,7 @@
         return parsePrice(priceElement?.textContent.trim() || 'N/A');
     }
 
-    function displayResults(row, averagePrice, trendPrice, sellerPrice, avgText, trendText, chartHTML) {
+    function displayResults(row, averagePrice, trendPrice, sellerPrice, averageRatio, trendRatio, avgText, trendText, chartHTML) {
         const lineContainer = row.querySelector('.line-container');
         if (!lineContainer) return;
 
@@ -579,8 +619,8 @@
 
         const innerLiner = createInnerLiner(isCartPage());
         innerLiner.append(
-            createResultContainer('30-day', avgText, averagePrice / sellerPrice),
-            createResultContainer('Trend', trendText, trendPrice / sellerPrice)
+            createResultContainer('30-day', avgText, averageRatio),
+            createResultContainer('Trend', trendText, trendRatio)
         );
         lineContainer.appendChild(innerLiner);
 
@@ -590,6 +630,9 @@
             const chart = createElementFromHTML(chartHTML);
             unsafeWindow.attachDraggableBoxIcon(chartIcon, chart, productName);
             lineContainer.appendChild(chartIcon);
+            row.dataset.cmGraphLoaded = '1';
+        } else if (!row.dataset.cmGraphLoaded) {
+            row.dataset.cmGraphLoaded = '0';
         }
     }
 
@@ -938,17 +981,26 @@
     }
 
     async function getCachedData(keyParts, expirationMs, fetchCallback) {
-        const storageKey = keyParts.join('|');
-        const cachedString = localStorage.getItem(storageKey);
+        const storageKey = getProductCacheStorageKey(keyParts);
+        let cachedEntry = null;
+        try {
+            cachedEntry = await getCacheEntry(storageKey);
+        } catch (error) {
+            GM_log(`[cache] Failed to read product cache ${storageKey}: ${error.message}`);
+        }
 
-        if (cachedString) {
-            try {
-                const { timestamp, data } = JSON.parse(cachedString);
-                if (Date.now() - timestamp < expirationMs) {
-                    return data;
+        if (cachedEntry?.kind === 'product-cache' && cachedEntry.cacheVersion === CACHE_VERSION) {
+            const { timestamp, data } = cachedEntry;
+            if (hasCacheableProductData(data) && Date.now() - timestamp < expirationMs) {
+                return data;
+            }
+
+            if (!hasCacheableProductData(data)) {
+                try {
+                    await deleteCacheEntry(storageKey);
+                } catch (error) {
+                    GM_log(`[cache] Failed to delete invalid cache ${storageKey}: ${error.message}`);
                 }
-            } catch (err) {
-                console.warn(`Failed to parse cached data for key: ${storageKey}`, err);
             }
         }
 
@@ -957,70 +1009,406 @@
             throw createRetryableError(`Non-cacheable product data for "${storageKey}"`, 'NON_CACHEABLE_PRODUCT_DATA');
         }
 
-        localStorage.setItem(storageKey, JSON.stringify({ timestamp: Date.now(), data: freshData }));
+        try {
+            await setCacheEntry(storageKey, {
+                kind: 'product-cache',
+                cacheVersion: CACHE_VERSION,
+                timestamp: Date.now(),
+                data: freshData
+            });
+        } catch (error) {
+            GM_log(`[cache] Failed to persist product cache ${storageKey}: ${error.message}`);
+        }
         return freshData;
     }
 
     function setLocalCache(keyParts, data) {
-        const storageKey = keyParts.join('|');
-        localStorage.setItem(storageKey, JSON.stringify({ timestamp: Date.now(), data }));
+        const storageKey = getProductCacheStorageKey(keyParts);
+        void setCacheEntry(storageKey, {
+            kind: 'product-cache',
+            cacheVersion: CACHE_VERSION,
+            timestamp: Date.now(),
+            data
+        }).catch(error => GM_log(`[cache] Failed to set local cache ${storageKey}: ${error.message}`));
     }
 
-    function checkLocalCache(keyParts) {
-        const storageKey = keyParts.join('|');
-        const cachedString = localStorage.getItem(storageKey);
+    async function checkLocalCache(keyParts) {
+        const storageKey = getProductCacheStorageKey(keyParts);
+        let cachedEntry = null;
+        try {
+            cachedEntry = await getCacheEntry(storageKey);
+        } catch (error) {
+            GM_log(`[cache] Failed to read local cache ${storageKey}: ${error.message}`);
+            return null;
+        }
+        if (!cachedEntry?.data) return null;
 
-        if (!cachedString) return null;
+        const { timestamp, data, cacheVersion } = cachedEntry;
+        if (cacheVersion !== CACHE_VERSION || !hasCacheableProductData(data)) {
+            try {
+                await deleteCacheEntry(storageKey);
+            } catch (error) {
+                GM_log(`[cache] Failed to remove stale cache ${storageKey}: ${error.message}`);
+            }
+            return null;
+        }
+
+        if (Date.now() - timestamp < getCacheExpirationMs()) return data;
+        return null;
+    }
+
+    async function cleanupExpiredCache() {
+        const now = Date.now();
+        let removed = 0;
 
         try {
-            const { timestamp, data } = JSON.parse(cachedString);
-            if (!hasCacheableProductData(data)) {
-                localStorage.removeItem(storageKey);
-                return null;
+            await iterateCacheEntries((key, entry, cursor) => {
+                if (!entry || typeof entry !== 'object') {
+                    cursor.delete();
+                    removed += 1;
+                    return;
+                }
+
+                if (entry.kind !== 'product-cache') return;
+                const isExpired = !entry.timestamp || now - entry.timestamp >= getCacheExpirationMs();
+                const isInvalid = entry.cacheVersion !== CACHE_VERSION || !hasCacheableProductData(entry.data);
+                if (isExpired || isInvalid) {
+                    cursor.delete();
+                    removed += 1;
+                }
+            });
+        } catch (error) {
+            GM_log(`[cache-cleanup] Failed during cleanup: ${error.message}`);
+            return;
+        }
+
+        if (removed > 0) {
+            GM_log(`[cache-cleanup] Removed ${removed} expired product cache entries.`);
+        }
+    }
+
+    function getProductCacheStorageKey(keyParts) {
+        return `product-cache|${keyParts.join('|')}`;
+    }
+
+    async function warmupPriceGuideData() {
+        if (priceGuideWarmupPromise) return priceGuideWarmupPromise;
+
+        const warmupPromise = (async () => {
+            const now = Date.now();
+            let cachedEntry = null;
+            try {
+                cachedEntry = await getCacheEntry(PRICE_GUIDE_CACHE_KEY);
+            } catch (error) {
+                GM_log(`[price-guide] Failed to read cached data: ${error.message}`);
+            }
+            const hasCachedLookup = Boolean(cachedEntry?.kind === 'price-guide-cache' && cachedEntry?.lookup);
+            const isCachedFresh = hasCachedLookup && cachedEntry.cacheVersion === PRICE_GUIDE_CACHE_VERSION &&
+                now - cachedEntry.fetchedAt < getCacheExpirationMs();
+
+            if (hasCachedLookup) {
+                priceGuideLookup = cachedEntry.lookup;
+                applyPriceGuideToRows();
             }
 
-            if (Date.now() - timestamp < getCacheExpirationMs()) return data;
-        } catch (err) {
-            console.warn(`Failed to parse cached data for key: ${storageKey}`, err);
+            if (isCachedFresh) {
+                setPriceGuideStatus(`Price guide: ready (${formatCacheAge(cachedEntry.fetchedAt)})`, 'ready');
+                return priceGuideLookup;
+            }
+
+            try {
+                setPriceGuideStatus('Price guide: downloading...', 'loading');
+                const payload = await fetchJsonWithFallback(PRICE_GUIDE_URL);
+                if (!Array.isArray(payload?.priceGuides)) {
+                    throw new Error('Price guide payload missing "priceGuides" array.');
+                }
+
+                setPriceGuideStatus('Price guide: parsing...', 'loading');
+                const lookup = buildPriceGuideLookup(payload.priceGuides);
+                const fetchedAt = Date.now();
+                try {
+                    await setCacheEntry(PRICE_GUIDE_CACHE_KEY, {
+                        kind: 'price-guide-cache',
+                        cacheVersion: PRICE_GUIDE_CACHE_VERSION,
+                        fetchedAt,
+                        lookup
+                    });
+                } catch (error) {
+                    GM_log(`[price-guide] Failed to persist data: ${error.message}`);
+                }
+
+                priceGuideLookup = lookup;
+                applyPriceGuideToRows();
+                setPriceGuideStatus(`Price guide: ready (${Object.keys(lookup).length} items)`, 'ready');
+                return lookup;
+            } catch (error) {
+                if (priceGuideLookup) {
+                    setPriceGuideStatus(`Price guide: stale (${error.message})`, 'warning');
+                    return priceGuideLookup;
+                }
+
+                setPriceGuideStatus(`Price guide: error (${error.message})`, 'error');
+                throw error;
+            }
+        })();
+
+        priceGuideWarmupPromise = warmupPromise.catch(error => {
+            priceGuideWarmupPromise = null;
+            throw error;
+        });
+
+        return priceGuideWarmupPromise;
+    }
+
+    function buildPriceGuideLookup(priceGuides) {
+        const lookup = {};
+
+        priceGuides.forEach(entry => {
+            const idProduct = parsePositiveInteger(entry?.idProduct);
+            if (!idProduct) return;
+
+            lookup[idProduct] = {
+                avg: toNullableNumber(entry.avg),
+                avg30: toNullableNumber(entry.avg30),
+                trend: toNullableNumber(entry.trend),
+                avgFoil: toNullableNumber(entry['avg-foil']),
+                avg30Foil: toNullableNumber(entry['avg30-foil']),
+                trendFoil: toNullableNumber(entry['trend-foil'])
+            };
+        });
+
+        return lookup;
+    }
+
+    function applyPriceGuideToRows(rows = getCurrentRows()) {
+        if (!priceGuideLookup || !rows.length) return 0;
+
+        let updatedRows = 0;
+        rows.forEach(row => {
+            if (row.dataset.cmGraphLoaded === '1') return;
+            if (applyPriceGuideToRow(row)) updatedRows += 1;
+        });
+        return updatedRows;
+    }
+
+    function applyPriceGuideToRow(row) {
+        const link = row.querySelector('a[href*="/en/Magic/Products/"]');
+        if (!link) return false;
+
+        const idProduct = extractProductIdFromRow(row, link);
+        if (!idProduct) return false;
+
+        const entry = priceGuideLookup?.[idProduct];
+        if (!entry) return false;
+
+        const isFoil = getFoilBool(row);
+        const averageValue = pickFirstNumber(isFoil ? [entry.avg30Foil, entry.avgFoil, entry.avg30, entry.avg] : [entry.avg30, entry.avg]);
+        const trendValue = pickFirstNumber(isFoil ? [entry.trendFoil, entry.trend] : [entry.trend]);
+
+        if (!Number.isFinite(averageValue) && !Number.isFinite(trendValue)) return false;
+
+        processProductPage({
+            averagePriceText: formatPriceText(averageValue),
+            trendPriceText: formatPriceText(trendValue),
+            chartWrapperHTML: ''
+        }, row);
+        row.dataset.cmPriceGuideApplied = '1';
+        row.dataset.cmProductId = String(idProduct);
+        return true;
+    }
+
+    function extractProductIdFromRow(row, link) {
+        const candidates = [
+            row?.dataset?.idProduct,
+            row?.dataset?.productId,
+            row?.getAttribute('data-id-product'),
+            row?.getAttribute('data-product-id'),
+            link?.dataset?.idProduct,
+            link?.dataset?.productId,
+            row?.querySelector('input[name="idProduct"]')?.value,
+            row?.querySelector('input[name="productId"]')?.value
+        ];
+
+        const href = link?.getAttribute('href') || '';
+        const hrefIdParam = /(?:[?&])idProduct=(\d+)/i.exec(href)?.[1];
+        const hrefNumericTail = /\/(\d+)(?:[/?#]|$)/.exec(href)?.[1];
+        candidates.push(hrefIdParam, hrefNumericTail);
+
+        for (const value of candidates) {
+            const parsed = parsePositiveInteger(value);
+            if (parsed) return parsed;
         }
 
         return null;
     }
 
-    function cleanupExpiredCache() {
-        const now = Date.now();
-        const keysToRemove = [];
+    function pickFirstNumber(values) {
+        for (const value of values) {
+            if (Number.isFinite(value)) return value;
+        }
+        return NaN;
+    }
 
-        for (let i = 0; i < localStorage.length; i++) {
-            const key = localStorage.key(i);
-            if (key && key.includes('cardmarket.com') && key.includes('|')) {
-                const cachedString = localStorage.getItem(key);
-                try {
-                    const { timestamp, data } = JSON.parse(cachedString);
-                    const looksLikeProductPayload = Boolean(
-                        data &&
-                        typeof data === 'object' &&
-                        ('averagePriceText' in data || 'trendPriceText' in data || 'chartWrapperHTML' in data)
-                    );
+    function toNullableNumber(value) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
 
-                    if (looksLikeProductPayload && !hasCacheableProductData(data)) {
-                        keysToRemove.push(key);
-                        continue;
-                    }
+    function parsePositiveInteger(value) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return null;
+        const integerValue = Math.round(parsed);
+        return integerValue > 0 ? integerValue : null;
+    }
 
-                    if (timestamp && now - timestamp >= getCacheExpirationMs()) {
-                        keysToRemove.push(key);
-                    }
-                } catch (err) {
-                    keysToRemove.push(key); // Remove corrupted entries
-                }
+    function formatPriceText(value) {
+        return Number.isFinite(value) ? `${value.toFixed(2)} €` : 'N/A';
+    }
+
+    function setPriceGuideStatus(text, tone = 'neutral') {
+        const palette = {
+            neutral: { background: '#f7f7f7', border: '#bbb', color: '#555' },
+            loading: { background: '#fff8e1', border: '#f1c26b', color: '#7a5400' },
+            ready: { background: '#edf7ed', border: '#7cc47f', color: '#1d6f22' },
+            warning: { background: '#fff4e5', border: '#d99d5c', color: '#8a4b08' },
+            error: { background: '#fdecea', border: '#d67a76', color: '#9a1c1c' }
+        };
+
+        const style = palette[tone] || palette.neutral;
+        priceGuideStatusBadges.forEach(badge => {
+            badge.textContent = text;
+            badge.style.background = style.background;
+            badge.style.borderColor = style.border;
+            badge.style.color = style.color;
+        });
+    }
+
+    function formatCacheAge(timestamp) {
+        if (!timestamp) return 'unknown';
+        const minutes = Math.max(0, Math.round((Date.now() - timestamp) / 60000));
+        if (minutes < 1) return 'just now';
+        if (minutes < 60) return `${minutes}m ago`;
+        const hours = Math.round(minutes / 60);
+        return `${hours}h ago`;
+    }
+
+    async function fetchJsonWithFallback(url) {
+        try {
+            const response = await fetch(url, { cache: 'no-store' });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status} while fetching ${url}`);
             }
+            return response.json();
+        } catch (fetchError) {
+            return fetchJsonViaGmRequest(url, fetchError);
+        }
+    }
+
+    function fetchJsonViaGmRequest(url, fallbackError) {
+        if (typeof GM_xmlhttpRequest !== 'function') {
+            return Promise.reject(fallbackError);
         }
 
-        keysToRemove.forEach(key => localStorage.removeItem(key));
-        if (keysToRemove.length > 0) {
-            console.log(`[cache-cleanup] Removed ${keysToRemove.length} expired entries.`);
-        }
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                headers: { 'Cache-Control': 'no-cache' },
+                onload: response => {
+                    if (response.status < 200 || response.status >= 300) {
+                        reject(new Error(`HTTP ${response.status} while fetching ${url}`));
+                        return;
+                    }
+
+                    try {
+                        resolve(JSON.parse(response.responseText));
+                    } catch (error) {
+                        reject(new Error(`Failed to parse JSON from ${url}: ${error.message}`));
+                    }
+                },
+                onerror: () => reject(fallbackError || new Error(`Request failed for ${url}`)),
+                ontimeout: () => reject(new Error(`Request timed out for ${url}`))
+            });
+        });
+    }
+
+    function openCacheDb() {
+        if (cacheDbPromise) return cacheDbPromise;
+
+        cacheDbPromise = new Promise((resolve, reject) => {
+            if (typeof indexedDB === 'undefined') {
+                reject(new Error('IndexedDB is not available.'));
+                return;
+            }
+
+            const request = indexedDB.open(CACHE_DB_NAME, CACHE_DB_VERSION);
+
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(CACHE_DB_STORE)) {
+                    db.createObjectStore(CACHE_DB_STORE, { keyPath: 'key' });
+                }
+            };
+
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error('Failed to open cache DB.'));
+        });
+
+        return cacheDbPromise;
+    }
+
+    async function getCacheEntry(key) {
+        const db = await openCacheDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(CACHE_DB_STORE, 'readonly');
+            const request = tx.objectStore(CACHE_DB_STORE).get(key);
+            request.onsuccess = () => resolve(request.result?.value || null);
+            request.onerror = () => reject(request.error || new Error(`Failed to read cache key: ${key}`));
+        });
+    }
+
+    async function setCacheEntry(key, value) {
+        const db = await openCacheDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(CACHE_DB_STORE, 'readwrite');
+            const request = tx.objectStore(CACHE_DB_STORE).put({ key, value });
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error || new Error(`Failed to write cache key: ${key}`));
+        });
+    }
+
+    async function deleteCacheEntry(key) {
+        const db = await openCacheDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(CACHE_DB_STORE, 'readwrite');
+            const request = tx.objectStore(CACHE_DB_STORE).delete(key);
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error || new Error(`Failed to delete cache key: ${key}`));
+        });
+    }
+
+    async function iterateCacheEntries(onEntry) {
+        const db = await openCacheDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(CACHE_DB_STORE, 'readwrite');
+            const store = tx.objectStore(CACHE_DB_STORE);
+            const request = store.openCursor();
+
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) return;
+                try {
+                    onEntry(cursor.key, cursor.value?.value, cursor);
+                    cursor.continue();
+                } catch (error) {
+                    reject(error);
+                }
+            };
+
+            request.onerror = () => reject(request.error || new Error('Failed to iterate cache entries.'));
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error || new Error('Failed cache iteration transaction.'));
+        });
     }
 
     // ===== SETTINGS =====
@@ -1043,6 +1431,7 @@
         const source = candidate && typeof candidate === 'object' ? candidate : {};
         return {
             cacheExpirationHours: sanitizeInteger(source.cacheExpirationHours, DEFAULT_SETTINGS.cacheExpirationHours, 1, 720),
+            graphRatioThreshold: sanitizeFloat(source.graphRatioThreshold, DEFAULT_SETTINGS.graphRatioThreshold, 0.5, 5, 2),
             requestDelayMs: sanitizeInteger(source.requestDelayMs, DEFAULT_SETTINGS.requestDelayMs, 100, 10000),
             maxInFlightRequests: sanitizeInteger(source.maxInFlightRequests, DEFAULT_SETTINGS.maxInFlightRequests, 0, 100),
             delayRandomizationPercent: sanitizeInteger(source.delayRandomizationPercent, DEFAULT_SETTINGS.delayRandomizationPercent, 0, 100),
@@ -1058,6 +1447,14 @@
         const parsed = Number(value);
         if (!Number.isFinite(parsed)) return fallback;
         return Math.min(max, Math.max(min, Math.round(parsed)));
+    }
+
+    function sanitizeFloat(value, fallback, min, max, precision = 2) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return fallback;
+        const bounded = Math.min(max, Math.max(min, parsed));
+        const multiplier = Math.pow(10, precision);
+        return Math.round(bounded * multiplier) / multiplier;
     }
 
     function sanitizeQueueMode(value) {
@@ -1083,7 +1480,8 @@
             timestamp: Date.now(),
             data: settings
         }));
-        cleanupExpiredCache();
+        refreshThresholdButtonLabels();
+        void cleanupExpiredCache();
     }
 
     function getCacheExpirationMs() {
@@ -1128,7 +1526,7 @@
         title.style.cssText = 'margin:0 0 6px 0;font-size:18px';
 
         const subtitle = document.createElement('p');
-        subtitle.textContent = 'These values are saved to localStorage and reused on future page loads.';
+        subtitle.textContent = 'These values are saved in browser storage and reused on future page loads.';
         subtitle.style.cssText = 'margin:0 0 14px 0;color:#555';
 
         const form = document.createElement('form');
@@ -1276,7 +1674,9 @@
                 return { error: `${field.label} must be between ${field.min} and ${field.max}.` };
             }
 
-            values[field.key] = Math.round(value);
+            values[field.key] = field.allowFloat
+                ? sanitizeFloat(value, DEFAULT_SETTINGS[field.key], field.min, field.max, 2)
+                : Math.round(value);
         }
 
         return { values };
@@ -1411,6 +1811,63 @@
         return !!row.querySelector('span.icon[aria-label="Foil"]');
     }
 
+    function getOfferRows() {
+        return Array.from(document.querySelectorAll('.article-row'));
+    }
+
+    function getCartRows() {
+        return Array.from(document.querySelectorAll('table.article-table.product-table tbody tr[data-article-id]'));
+    }
+
+    function getCurrentRows() {
+        if (isOffersPage()) return getOfferRows();
+        if (isCartPage()) return getCartRows();
+        return [];
+    }
+
+    function formatRatioThreshold(value) {
+        return Number.isFinite(value) ? Number(value).toFixed(2) : Number(settings.graphRatioThreshold).toFixed(2);
+    }
+
+    function refreshThresholdButtonLabels() {
+        mainButtons
+            .filter(button => button.dataset.role === 'graphs-threshold')
+            .forEach(button => {
+                const label = `💲 >= ${formatRatioThreshold(settings.graphRatioThreshold)}x`;
+                button.dataset.idleText = label;
+                if (!isProcessing || activeMainButton !== button) {
+                    enableButton(button, label);
+                }
+            });
+    }
+
+    function setRowRatios(row, averageRatio, trendRatio) {
+        if (Number.isFinite(averageRatio)) {
+            row.dataset.cmRatioAvg = averageRatio.toFixed(6);
+        } else {
+            delete row.dataset.cmRatioAvg;
+        }
+
+        if (Number.isFinite(trendRatio)) {
+            row.dataset.cmRatioTrend = trendRatio.toFixed(6);
+        } else {
+            delete row.dataset.cmRatioTrend;
+        }
+
+        const candidates = [averageRatio, trendRatio].filter(Number.isFinite);
+        if (!candidates.length) {
+            delete row.dataset.cmBestRatio;
+            return;
+        }
+
+        row.dataset.cmBestRatio = Math.max(...candidates).toFixed(6);
+    }
+
+    function getRowBestRatio(row) {
+        const value = Number(row?.dataset?.cmBestRatio);
+        return Number.isFinite(value) ? value : NaN;
+    }
+
     function sumPrices(urlData) {
         let trend = 0, average = 0;
         Object.values(urlData).forEach(({ trendPrice, averagePrice }) => {
@@ -1452,10 +1909,17 @@
         button.textContent = text;
     }
 
-    function startProcessing(fetchRows) {
+    function startProcessing(fetchRows, batchButton = null) {
         isProcessing = true;
         cancelRequested = false;
-        enableButton(mainButton, 'Cancel');
+        activeMainButton = batchButton || activeMainButton || mainButtons[0] || null;
+        mainButtons.forEach(button => {
+            if (button === activeMainButton) {
+                enableButton(button, 'Cancel');
+            } else {
+                disableButton(button, button.dataset.idleText || button.textContent);
+            }
+        });
         fetchRows.forEach(row => {
             const fetchBtn = row.querySelector('.line-fetch-button');
             if (fetchBtn) disableButton(fetchBtn, '...');
@@ -1466,14 +1930,17 @@
     function finishProcessing() {
         isProcessing = false;
         requestDelay = settings.requestDelayMs;
-        enableButton(mainButton, '💲 All');
+        mainButtons.forEach(button => enableButton(button, button.dataset.idleText || button.textContent));
+        activeMainButton = null;
         document.querySelectorAll('.line-fetch-button').forEach(btn => enableButton(btn, '💲'));
         GM_log('Processing finished or canceled.');
     }
 
     function requestCancellation() {
         cancelRequested = true;
-        disableButton(mainButton, 'Cancelling...');
+        if (activeMainButton) {
+            disableButton(activeMainButton, 'Cancelling...');
+        }
         GM_log('Cancellation requested...');
     }
 
