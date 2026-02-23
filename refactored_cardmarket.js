@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      5.3
+// @version      5.4
 // @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
@@ -28,6 +28,7 @@
     const DEFAULT_SETTINGS = {
         cacheExpirationHours: 24,
         requestDelayMs: 1000,
+        delayRandomizationPercent: 15,
         queueMode: 'wait_for_load',
         delayIncrementOn429Ms: 1000,
         iframeLoadTimeoutMs: 15000,
@@ -37,6 +38,7 @@
     const SETTINGS_FIELDS = [
         { key: 'cacheExpirationHours', label: 'Cache Expiration (hours)', min: 1, max: 720, step: 1 },
         { key: 'requestDelayMs', label: 'Request Delay (ms)', min: 100, max: 10000, step: 50 },
+        { key: 'delayRandomizationPercent', label: 'Delay Randomization (+/- %)', min: 0, max: 100, step: 1 },
         {
             key: 'queueMode',
             label: '$ All Queue Mode',
@@ -382,7 +384,10 @@
             })
             .finally(() => {
                 if (!cancelRequested) {
-                    setTimeout(() => processQueueWaitForLoad(queue, finishCallback, progressData), requestDelay);
+                    setTimeout(
+                        () => processQueueWaitForLoad(queue, finishCallback, progressData),
+                        getRandomizedDelayMs(requestDelay)
+                    );
                 } else {
                     finishProcessing();
                 }
@@ -413,7 +418,7 @@
 
         const scheduleNext = (delayMs) => {
             if (finished || cancelRequested || dispatchTimer || queue.length === 0) return;
-            dispatchTimer = setTimeout(dispatchNext, delayMs);
+            dispatchTimer = setTimeout(dispatchNext, getRandomizedDelayMs(delayMs));
         };
 
         const dispatchNext = () => {
@@ -858,6 +863,7 @@
         return {
             cacheExpirationHours: sanitizeInteger(source.cacheExpirationHours, DEFAULT_SETTINGS.cacheExpirationHours, 1, 720),
             requestDelayMs: sanitizeInteger(source.requestDelayMs, DEFAULT_SETTINGS.requestDelayMs, 100, 10000),
+            delayRandomizationPercent: sanitizeInteger(source.delayRandomizationPercent, DEFAULT_SETTINGS.delayRandomizationPercent, 0, 100),
             queueMode: sanitizeQueueMode(source.queueMode),
             delayIncrementOn429Ms: sanitizeInteger(source.delayIncrementOn429Ms, DEFAULT_SETTINGS.delayIncrementOn429Ms, 0, 10000),
             iframeLoadTimeoutMs: sanitizeInteger(source.iframeLoadTimeoutMs, DEFAULT_SETTINGS.iframeLoadTimeoutMs, 1000, 120000),
@@ -874,6 +880,17 @@
 
     function sanitizeQueueMode(value) {
         return value === 'fixed_delay' ? 'fixed_delay' : 'wait_for_load';
+    }
+
+    function getRandomizedDelayMs(baseDelayMs) {
+        const safeBaseDelayMs = Math.max(0, Math.round(Number(baseDelayMs) || 0));
+        const randomizationPercent = settings.delayRandomizationPercent || 0;
+        if (randomizationPercent <= 0) return safeBaseDelayMs;
+
+        const spread = safeBaseDelayMs * (randomizationPercent / 100);
+        const minDelay = Math.max(0, safeBaseDelayMs - spread);
+        const maxDelay = safeBaseDelayMs + spread;
+        return Math.round(minDelay + Math.random() * (maxDelay - minDelay));
     }
 
     function saveUserSettings(nextSettings) {
