@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      5.4
+// @version      5.5
 // @description  Adds main "💲 All" and per-line "💲" buttons with results wrapped in a bordered container.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
@@ -549,8 +549,9 @@
 
     function createResultContainer(label, priceText, difference) {
         const container = createContainer();
-        const diffSign = difference > 1 ? '-' : difference < 1 ? '+' : '';
-        const diffValue = `${Math.abs(difference).toFixed(2)} x`;
+        const hasValidDifference = Number.isFinite(difference);
+        const diffSign = hasValidDifference ? (difference > 1 ? '-' : difference < 1 ? '+' : '') : '';
+        const diffValue = hasValidDifference ? `${Math.abs(difference).toFixed(2)} x` : 'N/A';
 
         container.appendChild(document.createTextNode(`${label}: ${priceText} | Diff: `));
         container.appendChild(createDiffSpan(diffSign, diffValue));
@@ -654,8 +655,19 @@
                     }
 
                     if (Date.now() - startedAt >= settings.iframeReadyTimeoutMs) {
-                        GM_log(`[cache] Iframe data timeout for ${productUrl}, using best available data.`);
-                        return finalize(resolve, lastData);
+                        GM_log(`[cache] Iframe data timeout for ${productUrl}.`);
+                        clearInterval(pollInterval);
+
+                        const finalState = readFrameState();
+                        if (finalState.blocked) {
+                            return startManualUnblockMode();
+                        }
+
+                        if (hasCacheableProductData(lastData)) {
+                            return finalize(resolve, lastData);
+                        }
+
+                        return finalize(reject, new Error(`Iframe data unavailable for "${productUrl}"`));
                     }
                 }, IFRAME_READY_INTERVAL_MS);
             };
@@ -737,7 +749,11 @@
             'captcha',
             'security check',
             'access denied',
-            'attention required'
+            'attention required',
+            'cloudflare',
+            'ray id',
+            'please wait while we verify',
+            'enable javascript and cookies'
         ];
 
         if (markers.some(marker => title.includes(marker) || bodyText.includes(marker))) {
@@ -748,7 +764,10 @@
             doc.querySelector('#challenge-form') ||
             doc.querySelector('#challenge-running') ||
             doc.querySelector('[name="cf_captcha_kind"]') ||
-            doc.querySelector('iframe[src*="challenge"]')
+            doc.querySelector('iframe[src*="challenge"]') ||
+            doc.querySelector('script[src*="challenge-platform"]') ||
+            doc.querySelector('[data-translate="why_captcha_detail"]') ||
+            doc.querySelector('#cf-wrapper')
         );
     }
 
@@ -792,6 +811,10 @@
         }
 
         const freshData = await fetchCallback();
+        if (!hasCacheableProductData(freshData)) {
+            throw new Error(`Non-cacheable product data for "${storageKey}"`);
+        }
+
         localStorage.setItem(storageKey, JSON.stringify({ timestamp: Date.now(), data: freshData }));
         return freshData;
     }
@@ -809,6 +832,11 @@
 
         try {
             const { timestamp, data } = JSON.parse(cachedString);
+            if (!hasCacheableProductData(data)) {
+                localStorage.removeItem(storageKey);
+                return null;
+            }
+
             if (Date.now() - timestamp < getCacheExpirationMs()) return data;
         } catch (err) {
             console.warn(`Failed to parse cached data for key: ${storageKey}`, err);
@@ -826,7 +854,18 @@
             if (key && key.includes('cardmarket.com') && key.includes('|')) {
                 const cachedString = localStorage.getItem(key);
                 try {
-                    const { timestamp } = JSON.parse(cachedString);
+                    const { timestamp, data } = JSON.parse(cachedString);
+                    const looksLikeProductPayload = Boolean(
+                        data &&
+                        typeof data === 'object' &&
+                        ('averagePriceText' in data || 'trendPriceText' in data || 'chartWrapperHTML' in data)
+                    );
+
+                    if (looksLikeProductPayload && !hasCacheableProductData(data)) {
+                        keysToRemove.push(key);
+                        continue;
+                    }
+
                     if (timestamp && now - timestamp >= getCacheExpirationMs()) {
                         keysToRemove.push(key);
                     }
