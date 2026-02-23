@@ -1163,7 +1163,45 @@
 
     function parsePrice(priceText) {
         if (!priceText || priceText === 'N/A') return NaN;
-        return parseFloat(priceText.replace(' €', '').replace(',', '.').trim());
+        const inputText = String(priceText);
+        const isNegative = /^\s*-/.test(inputText);
+        const normalizedText = inputText
+            .replace(/\s/g, '')
+            .replace(/[^\d.,]/g, '');
+
+        if (!normalizedText || normalizedText === '-') return NaN;
+
+        const lastDot = normalizedText.lastIndexOf('.');
+        const lastComma = normalizedText.lastIndexOf(',');
+
+        if (lastDot === -1 && lastComma === -1) {
+            const parsedNoSeparator = parseFloat(normalizedText);
+            return isNegative ? -parsedNoSeparator : parsedNoSeparator;
+        }
+
+        const decimalSeparator = lastDot > lastComma ? '.' : ',';
+        const thousandSeparator = decimalSeparator === '.' ? ',' : '.';
+
+        const decimalCount = normalizedText.split(decimalSeparator).length - 1;
+        const lastDecimalIndex = normalizedText.lastIndexOf(decimalSeparator);
+        const decimalDigits = normalizedText.length - lastDecimalIndex - 1;
+
+        const hasThousandsOnly =
+            decimalCount > 1 ||
+            (decimalCount === 1 && decimalDigits === 3);
+
+        if (hasThousandsOnly) {
+            const parsedThousands = parseFloat(normalizedText.replace(/[.,]/g, ''));
+            return isNegative ? -parsedThousands : parsedThousands;
+        }
+
+        const parsedValue = parseFloat(
+            normalizedText
+                .split(thousandSeparator)
+                .join('')
+                .replace(decimalSeparator, '.')
+        );
+        return isNegative ? -parsedValue : parsedValue;
     }
 
     function getFoilState(row) {
