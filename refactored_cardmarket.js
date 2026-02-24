@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Refactored
 // @namespace    http://tampermonkey.net/
-// @version      6.4
+// @version      6.5
 // @description  Preloads daily price-guide data, renders ratios immediately, and loads graphs on demand.
 // @author       mfiferna
 // @homepage     https://github.com/mfiferna/cm-scripts
