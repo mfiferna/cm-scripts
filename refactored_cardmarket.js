@@ -43,7 +43,8 @@
         delayIncrementOn429Ms: 1000,
         iframeLoadTimeoutMs: 15000,
         iframeReadyTimeoutMs: 5000,
-        iframeManualTimeoutMinutes: 5
+        iframeManualTimeoutMinutes: 5,
+        splitRatioRows: false
     };
     const SETTINGS_FIELDS = [
         { key: 'cacheExpirationHours', label: 'Cache Expiration (hours)', min: 1, max: 720, step: 1 },
@@ -63,7 +64,8 @@
         { key: 'delayIncrementOn429Ms', label: '429 Delay Increment (ms)', min: 0, max: 10000, step: 50 },
         { key: 'iframeLoadTimeoutMs', label: 'Iframe Load Timeout (ms)', min: 1000, max: 120000, step: 500 },
         { key: 'iframeReadyTimeoutMs', label: 'Iframe Data Timeout (ms)', min: 500, max: 60000, step: 250 },
-        { key: 'iframeManualTimeoutMinutes', label: 'Manual Unblock Timeout (minutes)', min: 1, max: 60, step: 1 }
+        { key: 'iframeManualTimeoutMinutes', label: 'Manual Unblock Timeout (minutes)', min: 1, max: 60, step: 1 },
+        { key: 'splitRatioRows', label: 'Split 30d and TR onto separate lines', type: 'checkbox' }
     ];
 
     // State
@@ -389,12 +391,12 @@
             if (articleDiv) {
                 replaceOrInsert(seller, articleDiv, 'value-div',
                     'Estimated Value',
-                    `30-day: ${sellerAverage.toFixed(2)} € | Trend: ${sellerTrend.toFixed(2)} €`);
+                    `30d: ${sellerAverage.toFixed(2)} € | TR: ${sellerTrend.toFixed(2)} €`);
             }
             if (totalDiv) {
                 replaceOrInsert(seller, totalDiv, 'profit-div',
                     'Profit',
-                    `30-day: ${(sellerAverage - totalValue).toFixed(2)} € | Trend: ${(sellerTrend - totalValue).toFixed(2)} €`);
+                    `30d: ${(sellerAverage - totalValue).toFixed(2)} € | TR: ${(sellerTrend - totalValue).toFixed(2)} €`);
             }
         });
 
@@ -409,12 +411,12 @@
         if (articleValueDiv) {
             replaceOrInsert(cartDiv, articleValueDiv, 'value-div',
                 'Est. Value',
-                `30-day: ${totalAverage.toFixed(2)} € | Trend: ${totalTrend.toFixed(2)} €`);
+                `30d: ${totalAverage.toFixed(2)} € | TR: ${totalTrend.toFixed(2)} €`);
         }
         if (totalValueDiv) {
             replaceOrInsert(cartDiv, totalValueDiv, 'profit-div',
                 'Total Profit',
-                `30-day: ${(totalAverage - totalPrice).toFixed(2)} € | Trend: ${(totalTrend - totalPrice).toFixed(2)} €`);
+                `30d: ${(totalAverage - totalPrice).toFixed(2)} € | TR: ${(totalTrend - totalPrice).toFixed(2)} €`);
         }
     }
 
@@ -976,9 +978,13 @@
         clearOldResults(lineContainer);
 
         const innerLiner = createInnerLiner(isCartPage());
+        if (settings.splitRatioRows) {
+            innerLiner.style.flexDirection = 'column';
+            innerLiner.style.alignItems = 'flex-start';
+        }
         innerLiner.append(
-            createResultContainer('30-day', avgText, averageRatio),
-            createResultContainer('Trend', trendText, trendRatio)
+            createResultContainer('30d', avgText, averageRatio),
+            createResultContainer('TR', trendText, trendRatio)
         );
         lineContainer.appendChild(innerLiner);
 
@@ -1013,7 +1019,7 @@
         const diffSign = hasValidDifference ? (difference > 1 ? '-' : difference < 1 ? '+' : '') : '';
         const diffValue = hasValidDifference ? `${Math.abs(difference).toFixed(2)} x` : 'N/A';
 
-        container.appendChild(document.createTextNode(`${label}: ${priceText} | Diff: `));
+        container.appendChild(document.createTextNode(`${label}: ${priceText} | `));
         container.appendChild(createDiffSpan(diffSign, diffValue));
 
         return container;
@@ -2092,7 +2098,8 @@
             delayIncrementOn429Ms: sanitizeInteger(source.delayIncrementOn429Ms, DEFAULT_SETTINGS.delayIncrementOn429Ms, 0, 10000),
             iframeLoadTimeoutMs: sanitizeInteger(source.iframeLoadTimeoutMs, DEFAULT_SETTINGS.iframeLoadTimeoutMs, 1000, 120000),
             iframeReadyTimeoutMs: sanitizeInteger(source.iframeReadyTimeoutMs, DEFAULT_SETTINGS.iframeReadyTimeoutMs, 500, 60000),
-            iframeManualTimeoutMinutes: sanitizeInteger(source.iframeManualTimeoutMinutes, DEFAULT_SETTINGS.iframeManualTimeoutMinutes, 1, 60)
+            iframeManualTimeoutMinutes: sanitizeInteger(source.iframeManualTimeoutMinutes, DEFAULT_SETTINGS.iframeManualTimeoutMinutes, 1, 60),
+            splitRatioRows: Boolean(source.splitRatioRows ?? DEFAULT_SETTINGS.splitRatioRows)
         };
     }
 
@@ -2211,6 +2218,13 @@
                 });
 
                 control = select;
+            } else if (field.type === 'checkbox') {
+                const input = document.createElement('input');
+                input.type = 'checkbox';
+                input.name = field.key;
+                input.style.cssText = 'width:16px;height:16px;cursor:pointer';
+                row.style.cssText = 'display:flex;align-items:center;gap:8px';
+                control = input;
             } else {
                 const input = document.createElement('input');
                 input.type = 'number';
@@ -2322,7 +2336,12 @@
     function populateSettingsForm(values) {
         SETTINGS_FIELDS.forEach(field => {
             const control = settingsModal?.querySelector(`[name="${field.key}"]`);
-            if (control) control.value = String(values[field.key]);
+            if (!control) return;
+            if (field.type === 'checkbox') {
+                control.checked = Boolean(values[field.key]);
+            } else {
+                control.value = String(values[field.key]);
+            }
         });
 
         const errorText = settingsModal?.querySelector('.cm-settings-error');
@@ -2345,6 +2364,11 @@
                     return { error: `${field.label} has an invalid value.` };
                 }
                 values[field.key] = value;
+                continue;
+            }
+
+            if (field.type === 'checkbox') {
+                values[field.key] = control.checked;
                 continue;
             }
 
