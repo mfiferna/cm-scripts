@@ -56,7 +56,7 @@ Each entry in the `priceGuides` array contains:
 
 The script builds an in-memory lookup keyed by `idProduct`:
 
-```
+```js
 lookup[idProduct] = {
     avg, avg30, trend,           // non-foil values
     avgFoil, avg30Foil, trendFoil // foil values
@@ -210,10 +210,10 @@ For each product row, the script computes and displays:
 | **30-day average ratio** | `(avg30_price × quantity) / (seller_price × quantity)` | `"30-day: 1.50 € \| Diff: 1.25 x"` |
 | **Trend ratio** | `(trend_price × quantity) / (seller_price × quantity)` | `"Trend: 1.75 € \| Diff: 0.95 x"` |
 
-**Color coding**:
-- Ratio > 1 (seller price below market): **green** with `-` prefix → good deal
-- Ratio < 1 (seller price above market): **red** with `+` prefix → overpriced
-- Ratio = 1: **gray**, no prefix
+**Color coding** (where ratio = market price / seller price):
+- Ratio > 1 → market value **exceeds** seller price: **green** with `-` prefix (seller is cheaper — good deal)
+- Ratio < 1 → seller price **exceeds** market value: **red** with `+` prefix (seller is overpriced)
+- Ratio = 1 → prices match: **gray**, no prefix
 
 ### 4.3 Batch Operations
 
@@ -263,7 +263,7 @@ Instead of using `GM_xmlhttpRequest` (as in the old version), the refactored scr
 
 ### 5.2 Iframe Lifecycle
 
-```
+```text
 1. Wait for Cloudflare gate (if active)
 2. Create hidden iframe (off-screen, invisible)
 3. Set iframe.src = productUrl
