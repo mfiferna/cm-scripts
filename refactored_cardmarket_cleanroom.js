@@ -15,12 +15,12 @@
 // @connect      downloads.s3.cardmarket.com
 // @run-at       document-start
 // @require      https://cdn.jsdelivr.net/npm/idb@8/build/umd.js
-// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@main/cleanroom/00_shared.js
-// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@main/cleanroom/10_storage.js
-// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@main/cleanroom/20_price_guide.js
-// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@main/cleanroom/30_queue_iframe.js
-// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@main/cleanroom/40_ui.js
-// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@main/cleanroom/50_pages_bootstrap.js
+// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@rework/cleanroom/00_shared.js
+// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@rework/cleanroom/10_storage.js
+// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@rework/cleanroom/20_price_guide.js
+// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@rework/cleanroom/30_queue_iframe.js
+// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@rework/cleanroom/40_ui.js
+// @require      https://cdn.jsdelivr.net/gh/mfiferna/cm-scripts@rework/cleanroom/50_pages_bootstrap.js
 // ==/UserScript==
 
 (function () {
